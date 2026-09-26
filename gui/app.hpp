@@ -274,16 +274,17 @@ public:
 
 private:
     // ---- books & persistence
-    bool openBooks(const std::string& path);
+    bool openBooks(std::string path);
     void closeBooks();
     bool commit(const std::function<void(ob::Book&)>& change, std::string* error = nullptr,
                 const std::string& success = {});
     const Derived& derived();
     void loadConfig();
     void saveConfig() const;
-    void rememberRecent(const std::string& path);
+    void rememberRecent(std::string path);
 
     // ---- chrome
+    void drawFrame();
     void drawMenuBar();
     void drawSidebar();
     void drawStatusBar();

@@ -1,6 +1,7 @@
 #include "app.hpp"
 
 #include "imgui.h"
+#include "imgui_internal.h"  // ErrorRecoveryStoreState / TryToRecoverState
 #include "openbooks/cli.hpp"
 #include "openbooks/util.hpp"
 #include "platform.hpp"
@@ -28,12 +29,34 @@ constexpr float kNoticeSeconds = 6.0f;
 
 fs::path pathFromUtf8(const std::string& s) { return fs::u8path(s); }
 
+// A recent-files entry must be printable UTF-8 that converts to a path; anything else
+// (e.g. a corrupted config) is ignored rather than trusted.
+bool validRecentPath(const std::string& s) {
+    if (s.empty() || s.size() > 4096) return false;
+    for (char ch : s) {
+        if (static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F) return false;
+    }
+    try {
+        (void)fs::u8path(s);
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
 // The same file spelled differently (case on Windows, "..", slashes) counts once in Recent.
 bool samePath(const std::string& a, const std::string& b) {
-    std::error_code ec;
-    if (fs::equivalent(fs::u8path(a), fs::u8path(b), ec)) return true;
-    const std::string na = fs::u8path(a).lexically_normal().u8string();
-    const std::string nb = fs::u8path(b).lexically_normal().u8string();
+    if (a == b) return true;
+    std::string na;
+    std::string nb;
+    try {
+        std::error_code ec;
+        if (fs::equivalent(fs::u8path(a), fs::u8path(b), ec)) return true;
+        na = fs::u8path(a).lexically_normal().u8string();
+        nb = fs::u8path(b).lexically_normal().u8string();
+    } catch (const std::exception&) {
+        return false;
+    }
 #ifdef _WIN32
     return iequals(na, nb);
 #else
@@ -76,8 +99,9 @@ App::App(std::string initialPath) {
     if (!initialPath.empty()) {
         openBooks(initialPath);
     } else if (!recent_.empty()) {
+        const std::string last = recent_.front();  // a copy: openBooks() reorders recent_
         std::error_code ec;
-        if (fs::exists(pathFromUtf8(recent_.front()), ec)) openBooks(recent_.front());
+        if (validRecentPath(last) && fs::exists(pathFromUtf8(last), ec)) openBooks(last);
     }
 }
 
@@ -92,19 +116,35 @@ void App::loadConfig() {
         const std::string key = line.substr(0, eq);
         const std::string value = line.substr(eq + 1);
         if (key == "theme") darkTheme_ = value == "dark";
-        if (key == "recent" && !value.empty() && recent_.size() < 8 &&
+        if (key == "recent" && validRecentPath(value) && recent_.size() < 8 &&
             std::none_of(recent_.begin(), recent_.end(), [&](const std::string& r) { return samePath(r, value); }))
             recent_.push_back(value);
     }
 }
 
 void App::saveConfig() const {
-    std::ofstream out(pathFromUtf8(configPath_), std::ios::trunc);
-    out << "theme=" << (darkTheme_ ? "dark" : "light") << '\n';
-    for (const auto& r : recent_) out << "recent=" << r << '\n';
+    // Write a temporary file and rename it over the old one, so a crash mid-write can't leave
+    // a truncated config behind.
+    const fs::path target = pathFromUtf8(configPath_);
+    fs::path tmp = target;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        out << "theme=" << (darkTheme_ ? "dark" : "light") << '\n';
+        for (const auto& r : recent_) {
+            if (validRecentPath(r)) out << "recent=" << r << '\n';
+        }
+        if (!out) return;
+    }
+    std::error_code ec;
+    fs::rename(tmp, target, ec);
+    if (ec) {
+        fs::remove(target, ec);
+        fs::rename(tmp, target, ec);
+    }
 }
 
-void App::rememberRecent(const std::string& path) {
+void App::rememberRecent(std::string path) {  // by value: `path` may alias an element of recent_
     recent_.erase(std::remove_if(recent_.begin(), recent_.end(), [&](const std::string& r) { return samePath(r, path); }),
                   recent_.end());
     recent_.insert(recent_.begin(), path);
@@ -112,7 +152,7 @@ void App::rememberRecent(const std::string& path) {
     saveConfig();
 }
 
-bool App::openBooks(const std::string& path) {
+bool App::openBooks(std::string path) {  // by value, see rememberRecent()
     try {
         Book loaded = Book::load(path);
         book_ = std::move(loaded);
@@ -248,7 +288,27 @@ void App::chooseOpenFile() {
 
 // ----------------------------------------------------------------- frame
 
+// Draws one frame. Any exception thrown while drawing (a bug, or data the UI didn't expect)
+// is caught here: ImGui's window stack is unwound, the user sees the message, and the app
+// keeps running instead of aborting. The books themselves are never left half-changed,
+// because every change goes through commit().
 void App::frame() {
+    ImGuiErrorRecoveryState recovery;
+    ImGui::ErrorRecoveryStoreState(&recovery);
+    try {
+        drawFrame();
+    } catch (const std::exception& e) {
+        ImGuiIO& io = ImGui::GetIO();
+        const bool asserts = io.ConfigErrorRecoveryEnableAssert;
+        io.ConfigErrorRecoveryEnableAssert = false;  // we are recovering on purpose
+        ImGui::ErrorRecoveryTryToRecoverState(&recovery);
+        io.ConfigErrorRecoveryEnableAssert = asserts;
+        notify(std::string("Something went wrong: ") + e.what(), true);
+        if (book_) screen_ = Screen::Dashboard;  // don't keep re-entering the failing screen
+    }
+}
+
+void App::drawFrame() {
     drawMenuBar();
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();

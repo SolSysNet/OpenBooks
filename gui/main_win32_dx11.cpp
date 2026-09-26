@@ -171,7 +171,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     ImGui_ImplDX11_Init(g_device, g_context);
     obgui::loadFonts();
 
-    {
+    try {
         obgui::App app(firstArgumentUtf8());
 
         // Title bar follows the app theme on Windows 11.
@@ -235,6 +235,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             }
             if (app.quitRequested()) PostMessageW(hwnd, WM_CLOSE, 0, 0);
         }
+    } catch (const std::exception& e) {
+        // Last resort: report instead of vanishing (per-frame errors are already handled in App::frame).
+        const std::wstring message = L"OpenBooks hit an unexpected error and has to close:\n\n" + widen(e.what());
+        MessageBoxW(hwnd, message.c_str(), L"OpenBooks", MB_ICONERROR);
     }
 
     ImGui_ImplDX11_Shutdown();
