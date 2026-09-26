@@ -126,6 +126,10 @@ bool App::openBooks(const std::string& path) {
     customers_ = {};
     vendors_ = {};
     invoices_ = {};
+    estimates_ = {};
+    creditMemos_ = {};
+    salesReceipts_ = {};
+    recurringList_ = {};
     bills_ = {};
     payments_ = {};
     accountsList_ = {};
@@ -169,15 +173,29 @@ const Derived& App::derived() {
     const Book& b = *book_;
     Derived d;
     d.version = version_;
+    // Same rules as Book::documentBalance, computed in one pass instead of per document.
     for (const auto& doc : b.documents()) {
-        if (!doc.voided) d.documentBalance[doc.id] = doc.total();
+        if (doc.voided) continue;
+        if (doc.kind == DocKind::Invoice || doc.kind == DocKind::Bill || doc.kind == DocKind::CreditMemo)
+            d.documentBalance[doc.id] = doc.total();
     }
     for (const auto& p : b.payments()) {
         if (p.voided) continue;
         for (const auto& a : p.applications) d.documentBalance[a.documentId] -= a.amount;
     }
+    for (const auto& cm : b.documents()) {
+        if (cm.kind != DocKind::CreditMemo || cm.voided) continue;
+        for (const auto& a : cm.applications) {
+            d.documentBalance[a.documentId] -= a.amount;  // the invoice owes less
+            d.documentBalance[cm.id] -= a.amount;         // the credit has less left
+        }
+    }
     for (const auto& doc : b.documents()) {
-        if (!doc.voided) d.contactBalance[doc.contactId] += d.documentBalance[doc.id];
+        if (doc.voided) continue;
+        const auto it = d.documentBalance.find(doc.id);
+        if (it == d.documentBalance.end()) continue;
+        if (doc.kind == DocKind::CreditMemo) d.contactBalance[doc.contactId] -= it->second;
+        else d.contactBalance[doc.contactId] += it->second;
     }
     for (const auto& p : b.payments()) {
         if (!p.voided) d.contactBalance[p.contactId] -= p.unapplied();
@@ -278,6 +296,10 @@ void App::frame() {
             case Screen::Reports: drawReports(); break;
             case Screen::Company: drawCompany(); break;
             case Screen::DocumentEditor: drawDocumentEditor(); break;
+            case Screen::Estimates: drawDocuments(DocKind::Estimate); break;
+            case Screen::CreditMemos: drawDocuments(DocKind::CreditMemo); break;
+            case Screen::SalesReceipts: drawDocuments(DocKind::SalesReceipt); break;
+            case Screen::Recurring: drawRecurring(); break;
         }
         ImGui::EndChild();
         ImGui::PopStyleVar();
@@ -313,7 +335,11 @@ void App::drawMenuBar() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Create", open)) {
+        if (ImGui::MenuItem("Estimate")) startDocument(DocKind::Estimate, 0, Screen::Estimates);
         if (ImGui::MenuItem("Invoice")) startDocument(DocKind::Invoice, 0, Screen::Invoices);
+        if (ImGui::MenuItem("Sales Receipt")) startDocument(DocKind::SalesReceipt, 0, Screen::SalesReceipts);
+        if (ImGui::MenuItem("Credit Memo")) startDocument(DocKind::CreditMemo, 0, Screen::CreditMemos);
+        if (ImGui::MenuItem("Recurring Invoice")) startRecurringEditor(0);
         if (ImGui::MenuItem("Receive Payment")) startPayment(PaymentKind::Received, 0);
         ImGui::Separator();
         if (ImGui::MenuItem("Bill")) startDocument(DocKind::Bill, 0, Screen::Bills);
@@ -356,7 +382,14 @@ void App::drawSidebar() {
     };
     static const std::vector<Group> groups = {
         {"OVERVIEW", {{"Dashboard", Screen::Dashboard}, {"Reports", Screen::Reports}}},
-        {"SALES", {{"Customers", Screen::Customers}, {"Invoices", Screen::Invoices}, {"Receive Payment", Screen::ReceivePayment}}},
+        {"SALES",
+         {{"Customers", Screen::Customers},
+          {"Estimates", Screen::Estimates},
+          {"Invoices", Screen::Invoices},
+          {"Sales Receipts", Screen::SalesReceipts},
+          {"Credit Memos", Screen::CreditMemos},
+          {"Recurring Invoices", Screen::Recurring},
+          {"Receive Payment", Screen::ReceivePayment}}},
         {"PURCHASES", {{"Vendors", Screen::Vendors}, {"Bills", Screen::Bills}, {"Pay Bills", Screen::PayBills}}},
         {"BANKING", {{"Registers", Screen::Register}, {"Reconcile", Screen::Reconcile}, {"Payments", Screen::Payments}}},
         {"ACCOUNTING", {{"Chart of Accounts", Screen::Accounts}, {"Journal Entry", Screen::Journal},
@@ -542,6 +575,7 @@ void App::drawModals() {
     drawImportModal();
     drawRecategorizeModal();
     drawTransactionModal();
+    drawApplyCreditModal();
 }
 
 // ------------------------------------------------------------- dashboard
@@ -570,6 +604,27 @@ void App::drawDashboard() {
         if (ImGui::Button(labels[3])) openQuickEntry(TxnKind::Expense);
     }
     ui::Muted(("Today is " + today.str()).c_str());
+
+    // Recurring invoices waiting to be created.
+    if (const int due = b.dueRecurringCount(today); due > 0) {
+        ImGui::Dummy(ImVec2(0, 4));
+        ImVec4 bg = colorWarning();
+        bg.w = 0.14f;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+        ImGui::BeginChild("##recurringDue", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY);
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("%d recurring invoice%s due.", due, due == 1 ? " is" : "s are");
+        ImGui::SameLine();
+        bool create = ui::PrimaryButton("Create now");
+        ImGui::SameLine();
+        if (ImGui::Button("Review")) go(Screen::Recurring);
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        if (create) {
+            createDueRecurring();
+            return;
+        }
+    }
     ImGui::Dummy(ImVec2(0, 10));
 
     // Figures.
@@ -616,9 +671,11 @@ void App::drawDashboard() {
                 overdue += bal;
                 ++overdueCount;
             }
-        } else {
+        } else if (doc.kind == DocKind::Bill) {
             payable += bal;
             if (doc.dueDate < today) billsOverdue += bal;
+        } else if (doc.kind == DocKind::CreditMemo) {
+            receivable -= bal;  // unapplied customer credit
         }
     }
     const Date fyStart = b.fiscalYearStart(today);

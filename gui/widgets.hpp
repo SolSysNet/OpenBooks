@@ -54,6 +54,8 @@ void Muted(const char* text);
 void TextRight(const char* text);
 void MoneyText(ob::Money amount, bool rightAlign = true, bool redIfNegative = true);
 void Badge(const char* text, ImVec4 color);
+// Color for a document status label from ob::documentStatus ("Paid", "Overdue", ...).
+ImVec4 statusColor(const std::string& status);
 void ErrorText(const std::string& error);
 
 // ---- buttons

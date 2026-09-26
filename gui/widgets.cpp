@@ -350,6 +350,14 @@ void Badge(const char* text, ImVec4 color) {
     ImGui::TextColored(color, "%s", text);
 }
 
+ImVec4 statusColor(const std::string& s) {
+    if (s == "Paid" || s == "Applied" || s == "Converted" || s == "Accepted") return colorPositive();
+    if (s == "Overdue" || s == "Declined" || s == "Expired") return colorNegative();
+    if (s == "Partial" || s == "Partly applied" || s == "Due") return colorWarning();
+    if (s == "Void" || s == "Paused" || s == "Finished") return colorMuted();
+    return colorAccent();  // Open, Pending, Unapplied, Active
+}
+
 void ErrorText(const std::string& error) {
     if (error.empty()) return;
     ImGui::PushStyleColor(ImGuiCol_Text, colorNegative());

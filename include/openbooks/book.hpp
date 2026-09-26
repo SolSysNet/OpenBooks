@@ -79,10 +79,35 @@ public:
     void recategorize(int txnId, int fromAccountId, int toAccountId);
 
     // ---- Sales & purchases
-    int createDocument(Document d);  // line amounts and number are filled in
+    // Creates any document kind. Line amounts and the number are filled in. How it posts:
+    //   Invoice       Dr A/R, Cr income lines, Cr sales tax
+    //   Credit memo   Dr income lines, Dr sales tax, Cr A/R   (a customer credit)
+    //   Sales receipt Dr deposit account, Cr income lines, Cr sales tax
+    //   Bill          Dr expense lines, Cr A/P
+    //   Estimate      nothing (not in the ledger until converted to an invoice)
+    int createDocument(Document d);
     void voidDocument(int documentId);
     int recordPayment(Payment p);  // with no applications, pays the oldest open documents
     void voidPayment(int paymentId);
+
+    // ---- Estimates
+    int convertEstimate(int estimateId, Date invoiceDate);  // returns the new invoice id
+    void setEstimateStatus(int estimateId, EstimateStatus status);  // Pending / Accepted / Declined
+
+    // ---- Credit memos
+    void applyCredit(int creditMemoId, int invoiceId, Money amount);
+    void unapplyCredit(int creditMemoId, int invoiceId);
+
+    // ---- Recurring invoices
+    const std::vector<RecurringInvoice>& recurringInvoices() const { return recurring_; }
+    const RecurringInvoice& recurringInvoice(int id) const;
+    const RecurringInvoice& findRecurring(std::string_view ref) const;  // "#id" or name
+    int addRecurring(RecurringInvoice r);
+    void updateRecurring(const RecurringInvoice& r);  // keeps the count of invoices already created
+    void deleteRecurring(int id);                     // invoices already created are kept
+    // Creates every invoice due on or before `through`, oldest first. All or nothing.
+    std::vector<int> createDueRecurringInvoices(Date through);
+    int dueRecurringCount(Date through) const;
 
     // ---- Reconciliation
     void setSplitState(int txnId, int accountId, SplitState state);
@@ -92,9 +117,13 @@ public:
     std::map<int, Money> balances(const Period& period) const;  // raw, debit-positive
     Money balance(int accountId, const Period& period = {}) const;
     Money clearedBalance(int accountId) const;
-    Money documentPaid(int documentId, std::optional<Date> asOf = std::nullopt) const;
+    Money documentPaid(int documentId, std::optional<Date> asOf = std::nullopt) const;      // payments
+    Money documentCredited(int documentId, std::optional<Date> asOf = std::nullopt) const;  // credit memos
+    // Invoices/bills: amount still owed. Credit memos: credit not yet applied. Others: zero.
     Money documentBalance(int documentId, std::optional<Date> asOf = std::nullopt) const;
-    Money contactBalance(int contactId) const;  // open documents minus unapplied payments
+    Money contactBalance(int contactId) const;  // owed, less unapplied payments and credits
+    // Estimate status, taking conversion into account.
+    EstimateStatus estimateStatus(int estimateId) const;
     Date fiscalYearStart(Date d) const;
     bool isSubledgerAccount(int accountId) const;  // A/R or A/P
     bool isSystemAccount(int accountId) const;
@@ -121,6 +150,8 @@ private:
     void voidTransactionInternal(Transaction& t);
     bool accountInUse(int accountId) const;
     bool documentNumberTaken(DocKind kind, const std::string& number) const;
+    void validateRecurring(const RecurringInvoice& r) const;
+    RecurringInvoice& recurringMut(int id);
 
     std::vector<Account> accounts_;
     std::vector<Contact> contacts_;
@@ -128,7 +159,9 @@ private:
     std::vector<Transaction> transactions_;
     std::vector<Document> documents_;
     std::vector<Payment> payments_;
+    std::vector<RecurringInvoice> recurring_;
 
+    int nextRecurringId_ = 1;
     int nextAccountId_ = 1;
     int nextContactId_ = 1;
     int nextItemId_ = 1;

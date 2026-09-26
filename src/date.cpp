@@ -102,6 +102,15 @@ int Date::year() const { return civilFromDays(days_).y; }
 unsigned Date::month() const { return civilFromDays(days_).m; }
 unsigned Date::day() const { return civilFromDays(days_).d; }
 
+Date Date::addMonths(int n) const {
+    const Civil c = civilFromDays(days_);
+    const int total = c.y * 12 + static_cast<int>(c.m) - 1 + n;
+    const int year = total >= 0 ? total / 12 : (total - 11) / 12;
+    const auto month = static_cast<unsigned>(total - year * 12 + 1);
+    const unsigned day = c.d < daysInMonth(year, month) ? c.d : daysInMonth(year, month);
+    return fromYMD(year, month, day);
+}
+
 std::string Date::str() const {
     const Civil c = civilFromDays(days_);
     char buf[16];

@@ -42,7 +42,19 @@ struct Split {
     SplitState state = SplitState::Uncleared;
 };
 
-enum class TxnKind { Journal, Expense, Deposit, Transfer, Import, Invoice, Bill, CustomerPayment, VendorPayment };
+enum class TxnKind {
+    Journal,
+    Expense,
+    Deposit,
+    Transfer,
+    Import,
+    Invoice,
+    Bill,
+    CustomerPayment,
+    VendorPayment,
+    CreditMemo,
+    SalesReceipt,
+};
 
 const char* toString(TxnKind k);
 std::optional<TxnKind> parseTxnKind(std::string_view s);
@@ -93,12 +105,23 @@ struct Item {
     bool active = true;
 };
 
-// --------------------------------------------------------- Invoices / Bills
+// ------------------------------------------------------------ Sales & purchase forms
 
-enum class DocKind { Invoice, Bill };
+// Invoice, Bill, CreditMemo and SalesReceipt post to the ledger; an Estimate never does.
+enum class DocKind { Invoice, Bill, Estimate, CreditMemo, SalesReceipt };
 
-const char* toString(DocKind k);
+const char* toString(DocKind k);          // storage token, e.g. "CreditMemo"
 std::optional<DocKind> parseDocKind(std::string_view s);
+const char* docTitle(DocKind k);          // "Credit Memo"
+const char* docNoun(DocKind k);           // "credit memo"
+ContactKind partyKind(DocKind k);         // Bill -> Vendor, everything else -> Customer
+bool docPosts(DocKind k);                 // false only for estimates
+bool docHasDueDate(DocKind k);            // invoices, bills; estimates use it as "expires"
+
+enum class EstimateStatus { Pending, Accepted, Declined, Converted };
+
+const char* toString(EstimateStatus s);
+std::optional<EstimateStatus> parseEstimateStatus(std::string_view s);
 
 struct DocLine {
     int itemId = 0;
@@ -110,22 +133,66 @@ struct DocLine {
     bool taxable = true;
 };
 
+// Money from a payment or credit memo applied to an invoice or bill.
+struct Application {
+    int documentId = 0;
+    Money amount;
+};
+
 struct Document {
     int id = 0;
     DocKind kind = DocKind::Invoice;
     std::string number;
     int contactId = 0;
     Date date;
-    Date dueDate;
+    Date dueDate;  // estimates: expiry date; credit memos / sales receipts: same as date
     std::vector<DocLine> lines;
-    Decimal taxRate;  // percent, invoices only
+    Decimal taxRate;  // percent; not used on bills
     std::string memo;
-    int txnId = 0;
+    int txnId = 0;             // 0 for estimates
     bool voided = false;
+    int depositAccountId = 0;  // sales receipts: where the money went
+    int linkedDocId = 0;       // estimate <-> the invoice it was converted to
+    EstimateStatus estimateStatus = EstimateStatus::Pending;
+    int recurringId = 0;       // invoices created from a recurring template
+    std::vector<Application> applications;  // credit memos: invoices this credit was applied to
 
     Money subtotal() const;
     Money taxableSubtotal() const;
     Money tax() const;
+    Money total() const;
+    Money applied() const;  // sum of applications
+};
+
+// ---------------------------------------------------------------- Recurring
+
+enum class Frequency { Weekly, Monthly, Yearly };
+
+const char* toString(Frequency f);
+std::optional<Frequency> parseFrequency(std::string_view s);
+
+// A template that produces an invoice every `interval` weeks/months/years from startDate.
+struct RecurringInvoice {
+    int id = 0;
+    std::string name;
+    int contactId = 0;
+    std::vector<DocLine> lines;
+    Decimal taxRate;
+    std::string memo;
+    Frequency frequency = Frequency::Monthly;
+    int interval = 1;
+    Date startDate;
+    std::optional<Date> endDate;
+    int occurrencesCreated = 0;
+    bool active = true;
+
+    // Date of the k-th invoice (0-based). Monthly dates keep the start day, clamped to
+    // month ends (Jan 31 -> Feb 28 -> Mar 31).
+    Date occurrence(int k) const;
+    Date nextDate() const { return occurrence(occurrencesCreated); }
+    bool finished() const { return endDate.has_value() && nextDate() > *endDate; }
+    std::string scheduleText() const;  // "Every 2 months"
+    Money subtotal() const;
     Money total() const;
 };
 
@@ -135,11 +202,6 @@ enum class PaymentKind { Received, Paid };
 
 const char* toString(PaymentKind k);
 std::optional<PaymentKind> parsePaymentKind(std::string_view s);
-
-struct Application {
-    int documentId = 0;
-    Money amount;
-};
 
 struct Payment {
     int id = 0;
@@ -173,6 +235,9 @@ struct Company {
     int defaultTermsDays = 30;
     std::optional<Date> closedThrough;  // no changes allowed on or before this date
     int nextInvoiceNumber = 1001;
+    int nextEstimateNumber = 1;      // numbered EST-1, EST-2, ...
+    int nextCreditMemoNumber = 1;    // CM-1, ...
+    int nextSalesReceiptNumber = 1;  // SR-1, ...
     int receivablesAccountId = 0;
     int payablesAccountId = 0;
     int salesTaxAccountId = 0;

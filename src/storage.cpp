@@ -65,6 +65,8 @@ void record(std::ostream& out, std::initializer_list<std::string> fields) {
     out << '\n';
 }
 
+constexpr int kFileVersion = 2;
+
 std::string num(int v) { return std::to_string(v); }
 std::string flag(bool v) { return v ? "1" : "0"; }
 std::string stateCode(SplitState s) {
@@ -84,6 +86,7 @@ public:
         return fields_[i];
     }
     std::string optional(std::size_t i) const { return i < fields_.size() ? fields_[i] : std::string(); }
+    int optionalInt(std::size_t i, int fallback) const { return i < fields_.size() && !fields_[i].empty() ? integer(i) : fallback; }
     int integer(std::size_t i) const {
         const auto v = parseInt(str(i));
         if (!v || *v < INT_MIN || *v > INT_MAX) fail("invalid number '" + str(i) + "'");
@@ -158,13 +161,14 @@ void sortAndCheckIds(std::vector<T>& v, const char* what) {
 }  // namespace
 
 void Book::write(std::ostream& out) const {
-    out << "OPENBOOKS\t1\n";
+    out << "OPENBOOKS\t" << kFileVersion << "\n";
     const Company& c = company;
     record(out, {"COMPANY", c.name, c.address, num(c.fiscalYearStartMonth), num(c.defaultTermsDays),
                  c.closedThrough ? c.closedThrough->str() : "", num(c.nextInvoiceNumber),
                  num(c.receivablesAccountId), num(c.payablesAccountId), num(c.salesTaxAccountId),
                  num(c.retainedEarningsAccountId), c.email, c.phone, c.invoiceFooter,
-                 c.paperSize == PaperSize::A4 ? "a4" : "letter"});
+                 c.paperSize == PaperSize::A4 ? "a4" : "letter", num(c.nextEstimateNumber),
+                 num(c.nextCreditMemoNumber), num(c.nextSalesReceiptNumber)});
     for (const auto& a : accounts_)
         record(out, {"ACCOUNT", num(a.id), a.number, a.name, toString(a.type), a.description, flag(a.active)});
     for (const auto& k : contacts_)
@@ -180,9 +184,20 @@ void Book::write(std::ostream& out) const {
     }
     for (const auto& d : documents_) {
         record(out, {"DOC", num(d.id), toString(d.kind), d.number, num(d.contactId), d.date.str(), d.dueDate.str(),
-                     d.taxRate.str(), d.memo, num(d.txnId), flag(d.voided)});
+                     d.taxRate.str(), d.memo, num(d.txnId), flag(d.voided), num(d.depositAccountId),
+                     num(d.linkedDocId), toString(d.estimateStatus), num(d.recurringId)});
         for (const auto& l : d.lines)
             record(out, {"LINE", num(d.id), num(l.itemId), num(l.accountId), l.quantity.str(), l.rate.str(),
+                         l.amount.str(), flag(l.taxable), l.description});
+        for (const auto& a : d.applications)
+            record(out, {"CREDIT", num(d.id), num(a.documentId), a.amount.str()});
+    }
+    for (const auto& r : recurring_) {
+        record(out, {"RECUR", num(r.id), r.name, num(r.contactId), r.taxRate.str(), r.memo, toString(r.frequency),
+                     num(r.interval), r.startDate.str(), r.endDate ? r.endDate->str() : "",
+                     num(r.occurrencesCreated), flag(r.active)});
+        for (const auto& l : r.lines)
+            record(out, {"RLINE", num(r.id), num(l.itemId), num(l.accountId), l.quantity.str(), l.rate.str(),
                          l.amount.str(), flag(l.taxable), l.description});
     }
     for (const auto& p : payments_) {
@@ -201,11 +216,15 @@ Book Book::read(std::istream& in) {
     if (startsWith(line, "\xEF\xBB\xBF")) line.erase(0, 3);
     const auto header = split(line, '\t');
     if (header.size() < 2 || header[0] != "OPENBOOKS") throw Error("this is not an OpenBooks file");
-    if (header[1] != "1") throw Error("unsupported OpenBooks file version " + header[1] + "; upgrade OpenBooks");
+    // Version 1: up to 0.3. Version 2 (0.4) adds estimates, credit memos, sales receipts and
+    // recurring invoices; older OpenBooks releases refuse it rather than misread it.
+    if (header[1] != "1" && header[1] != "2")
+        throw Error("unsupported OpenBooks file version " + header[1] + "; upgrade OpenBooks");
 
     std::map<int, std::size_t> txnIndex;
     std::map<int, std::size_t> docIndex;
     std::map<int, std::size_t> payIndex;
+    std::map<int, std::size_t> recurIndex;
 
     while (std::getline(in, line)) {
         ++lineNo;
@@ -237,6 +256,10 @@ Book Book::read(std::istream& in) {
             if (paper.empty() || paper == "letter") c.paperSize = PaperSize::Letter;
             else if (paper == "a4") c.paperSize = PaperSize::A4;
             else f.fail("invalid paper size '" + paper + "'");
+            // Added in 0.4 (file version 2).
+            c.nextEstimateNumber = f.optionalInt(15, 1);
+            c.nextCreditMemoNumber = f.optionalInt(16, 1);
+            c.nextSalesReceiptNumber = f.optionalInt(17, 1);
         } else if (type == "ACCOUNT") {
             Account a;
             a.id = f.integer(1);
@@ -300,6 +323,10 @@ Book Book::read(std::istream& in) {
             d.memo = f.str(8);
             d.txnId = f.integer(9);
             d.voided = f.boolean(10);
+            d.depositAccountId = f.optionalInt(11, 0);
+            d.linkedDocId = f.optionalInt(12, 0);
+            if (!f.optional(13).empty()) d.estimateStatus = f.parsed<EstimateStatus>(13, parseEstimateStatus, "estimate status");
+            d.recurringId = f.optionalInt(14, 0);
             if (!docIndex.emplace(d.id, b.documents_.size()).second) f.fail("duplicate document id");
             b.documents_.push_back(std::move(d));
         } else if (type == "LINE") {
@@ -332,6 +359,38 @@ Book Book::read(std::istream& in) {
             const auto it = payIndex.find(f.integer(1));
             if (it == payIndex.end()) f.fail("application refers to an unknown payment");
             b.payments_[it->second].applications.push_back(Application{f.integer(2), f.money(3)});
+        } else if (type == "CREDIT") {
+            const auto it = docIndex.find(f.integer(1));
+            if (it == docIndex.end()) f.fail("credit application refers to an unknown credit memo");
+            b.documents_[it->second].applications.push_back(Application{f.integer(2), f.money(3)});
+        } else if (type == "RECUR") {
+            RecurringInvoice r;
+            r.id = f.integer(1);
+            r.name = f.str(2);
+            r.contactId = f.integer(3);
+            r.taxRate = f.decimal(4);
+            r.memo = f.str(5);
+            r.frequency = f.parsed<Frequency>(6, parseFrequency, "frequency");
+            r.interval = f.integer(7);
+            if (r.interval < 1) f.fail("invalid repeat interval");
+            r.startDate = f.date(8);
+            r.endDate = f.optionalDate(9);
+            r.occurrencesCreated = f.integer(10);
+            r.active = f.boolean(11);
+            if (!recurIndex.emplace(r.id, b.recurring_.size()).second) f.fail("duplicate recurring invoice id");
+            b.recurring_.push_back(std::move(r));
+        } else if (type == "RLINE") {
+            const auto it = recurIndex.find(f.integer(1));
+            if (it == recurIndex.end()) f.fail("line refers to an unknown recurring invoice");
+            DocLine l;
+            l.itemId = f.integer(2);
+            l.accountId = f.integer(3);
+            l.quantity = f.decimal(4);
+            l.rate = f.money(5);
+            l.amount = f.money(6);
+            l.taxable = f.boolean(7);
+            l.description = f.str(8);
+            b.recurring_[it->second].lines.push_back(std::move(l));
         } else {
             f.fail("unknown record type '" + type + "'");
         }
@@ -343,6 +402,7 @@ Book Book::read(std::istream& in) {
     sortAndCheckIds(b.transactions_, "transaction");
     sortAndCheckIds(b.documents_, "document");
     sortAndCheckIds(b.payments_, "payment");
+    sortAndCheckIds(b.recurring_, "recurring invoice");
 
     // Integrity: every transaction must balance and reference real accounts.
     std::set<int> accountIds;
@@ -366,6 +426,7 @@ Book Book::read(std::istream& in) {
     b.nextTxnId_ = nextId(b.transactions_);
     b.nextDocId_ = nextId(b.documents_);
     b.nextPaymentId_ = nextId(b.payments_);
+    b.nextRecurringId_ = nextId(b.recurring_);
     return b;
 }
 

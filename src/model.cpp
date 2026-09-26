@@ -40,13 +40,16 @@ const char* toString(TxnKind k) {
         case TxnKind::Bill: return "Bill";
         case TxnKind::CustomerPayment: return "Payment";
         case TxnKind::VendorPayment: return "BillPayment";
+        case TxnKind::CreditMemo: return "CreditMemo";
+        case TxnKind::SalesReceipt: return "SalesReceipt";
     }
     return "?";
 }
 
 std::optional<TxnKind> parseTxnKind(std::string_view s) {
     for (TxnKind k : {TxnKind::Journal, TxnKind::Expense, TxnKind::Deposit, TxnKind::Transfer, TxnKind::Import,
-                      TxnKind::Invoice, TxnKind::Bill, TxnKind::CustomerPayment, TxnKind::VendorPayment}) {
+                      TxnKind::Invoice, TxnKind::Bill, TxnKind::CustomerPayment, TxnKind::VendorPayment,
+                      TxnKind::CreditMemo, TxnKind::SalesReceipt}) {
         if (iequals(s, toString(k))) return k;
     }
     return std::nullopt;
@@ -81,11 +84,84 @@ std::optional<ContactKind> parseContactKind(std::string_view s) {
     return std::nullopt;
 }
 
-const char* toString(DocKind k) { return k == DocKind::Invoice ? "Invoice" : "Bill"; }
+const char* toString(DocKind k) {
+    switch (k) {
+        case DocKind::Invoice: return "Invoice";
+        case DocKind::Bill: return "Bill";
+        case DocKind::Estimate: return "Estimate";
+        case DocKind::CreditMemo: return "CreditMemo";
+        case DocKind::SalesReceipt: return "SalesReceipt";
+    }
+    return "?";
+}
 
 std::optional<DocKind> parseDocKind(std::string_view s) {
-    if (iequals(s, "invoice")) return DocKind::Invoice;
-    if (iequals(s, "bill")) return DocKind::Bill;
+    for (DocKind k : {DocKind::Invoice, DocKind::Bill, DocKind::Estimate, DocKind::CreditMemo, DocKind::SalesReceipt}) {
+        if (iequals(s, toString(k))) return k;
+    }
+    return std::nullopt;
+}
+
+const char* docTitle(DocKind k) {
+    switch (k) {
+        case DocKind::Invoice: return "Invoice";
+        case DocKind::Bill: return "Bill";
+        case DocKind::Estimate: return "Estimate";
+        case DocKind::CreditMemo: return "Credit Memo";
+        case DocKind::SalesReceipt: return "Sales Receipt";
+    }
+    return "?";
+}
+
+const char* docNoun(DocKind k) {
+    switch (k) {
+        case DocKind::Invoice: return "invoice";
+        case DocKind::Bill: return "bill";
+        case DocKind::Estimate: return "estimate";
+        case DocKind::CreditMemo: return "credit memo";
+        case DocKind::SalesReceipt: return "sales receipt";
+    }
+    return "?";
+}
+
+ContactKind partyKind(DocKind k) { return k == DocKind::Bill ? ContactKind::Vendor : ContactKind::Customer; }
+
+bool docPosts(DocKind k) { return k != DocKind::Estimate; }
+
+bool docHasDueDate(DocKind k) { return k == DocKind::Invoice || k == DocKind::Bill || k == DocKind::Estimate; }
+
+const char* toString(EstimateStatus s) {
+    switch (s) {
+        case EstimateStatus::Pending: return "Pending";
+        case EstimateStatus::Accepted: return "Accepted";
+        case EstimateStatus::Declined: return "Declined";
+        case EstimateStatus::Converted: return "Converted";
+    }
+    return "?";
+}
+
+std::optional<EstimateStatus> parseEstimateStatus(std::string_view s) {
+    for (EstimateStatus v :
+         {EstimateStatus::Pending, EstimateStatus::Accepted, EstimateStatus::Declined, EstimateStatus::Converted}) {
+        if (iequals(s, toString(v))) return v;
+    }
+    return std::nullopt;
+}
+
+const char* toString(Frequency f) {
+    switch (f) {
+        case Frequency::Weekly: return "Weekly";
+        case Frequency::Monthly: return "Monthly";
+        case Frequency::Yearly: return "Yearly";
+    }
+    return "?";
+}
+
+std::optional<Frequency> parseFrequency(std::string_view s) {
+    const std::string l = toLower(trim(s));
+    if (l == "weekly" || l == "week" || l == "weeks") return Frequency::Weekly;
+    if (l == "monthly" || l == "month" || l == "months") return Frequency::Monthly;
+    if (l == "yearly" || l == "year" || l == "years" || l == "annually") return Frequency::Yearly;
     return std::nullopt;
 }
 
@@ -114,6 +190,41 @@ Money Document::taxableSubtotal() const {
 Money Document::tax() const { return percentOf(taxableSubtotal(), taxRate); }
 
 Money Document::total() const { return subtotal() + tax(); }
+
+Money Document::applied() const {
+    Money s;
+    for (const auto& a : applications) s += a.amount;
+    return s;
+}
+
+Date RecurringInvoice::occurrence(int k) const {
+    switch (frequency) {
+        case Frequency::Weekly: return startDate.addDays(7 * interval * k);
+        case Frequency::Monthly: return startDate.addMonths(interval * k);
+        case Frequency::Yearly: return startDate.addMonths(12 * interval * k);
+    }
+    return startDate;
+}
+
+std::string RecurringInvoice::scheduleText() const {
+    const char* unit = frequency == Frequency::Weekly ? "week" : frequency == Frequency::Monthly ? "month" : "year";
+    if (interval == 1) return std::string("Every ") + unit;
+    return "Every " + std::to_string(interval) + " " + unit + "s";
+}
+
+Money RecurringInvoice::subtotal() const {
+    Money s;
+    for (const auto& l : lines) s += l.amount;
+    return s;
+}
+
+Money RecurringInvoice::total() const {
+    Money taxable;
+    for (const auto& l : lines) {
+        if (l.taxable) taxable += l.amount;
+    }
+    return subtotal() + percentOf(taxable, taxRate);
+}
 
 Money Payment::applied() const {
     Money s;
