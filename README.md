@@ -124,6 +124,20 @@ a unique prefix (`Acme` → "Acme Corp"), an account number (`1000`), or `#id`.
 | `account` | the income account (invoices) or expense account (bills) |
 | `taxable` | `yes`/`no` (invoices only) |
 
+### PDF invoices
+
+```bash
+openbooks company set --email billing@bluedoor.example --phone "(555) 010-2030" \
+    --invoice-footer "Pay by bank transfer to account 000123. Thank you!" --paper letter
+openbooks invoice pdf 1001                    # writes "Invoice 1001 - Acme Corp.pdf"
+openbooks invoice pdf 1001 --out acme.pdf --force
+```
+
+In the desktop app, open an invoice or bill and choose **Save PDF...** or **Preview PDF**.
+PDFs support multiple pages, carry VOID and PAID stamps, and come in Letter or A4. They're
+produced by a small built-in writer, so there's no extra dependency and no active content
+(see [SECURITY.md](SECURITY.md)).
+
 ### Reconciling a bank statement
 
 ```bash
@@ -170,6 +184,8 @@ include/openbooks/   public headers
   book.hpp           the ledger engine and all business rules
   reports.hpp        financial reports and text/CSV rendering
   import.hpp         bank/card CSV import
+  pdf.hpp            minimal, dependency-free PDF writer
+  invoice_pdf.hpp    invoice/bill PDF layout
   cli.hpp            command-line front end
 src/                 engine + CLI implementation
 gui/                 desktop app
@@ -192,7 +208,8 @@ books in place. It applies each change to a copy, saves that copy, and only then
 - [x] Desktop GUI
 - [ ] Native file dialogs on Linux/macOS (currently typed paths)
 - [ ] Estimates, credit memos, sales receipts, recurring invoices
-- [ ] PDF invoice output and email delivery
+- [x] PDF invoices and bills
+- [ ] Company logo on PDFs; email delivery (would need an explicit, opt-in network design)
 - [ ] Inventory quantity tracking and COGS
 - [ ] Classes/locations, budgets, cash-basis reports
 - [ ] Multi-currency

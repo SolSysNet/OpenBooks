@@ -20,6 +20,10 @@ std::optional<std::string> saveFileDialog(const char* title, FileFilter filter, 
                                           const std::string& suggestedName);
 bool nativeFileDialogsAvailable();
 
+// Opens a local file with the user's default application (e.g. a PDF viewer).
+// Returns false when unsupported or when the launch failed.
+bool openWithDefaultApp(const std::string& path);
+
 // Per-user settings directory (created on demand), e.g. %APPDATA%\OpenBooks.
 std::string configDirectory();
 

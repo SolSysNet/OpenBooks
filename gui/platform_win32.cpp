@@ -5,6 +5,7 @@
 #endif
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <shlobj.h>
 
 #include <filesystem>
@@ -78,6 +79,17 @@ std::optional<std::string> saveFileDialog(const char* title, FileFilter filter, 
 }
 
 bool nativeFileDialogsAvailable() { return true; }
+
+bool openWithDefaultApp(const std::string& path) {
+    // Only local, existing regular files: never URLs, folders or anything ShellExecute
+    // could interpret as a command.
+    std::error_code ec;
+    const std::filesystem::path p = std::filesystem::u8path(path);
+    if (!p.is_absolute() || !std::filesystem::is_regular_file(p, ec)) return false;
+    const auto result = reinterpret_cast<INT_PTR>(
+        ShellExecuteW(GetActiveWindow(), L"open", p.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    return result > 32;
+}
 
 std::string configDirectory() {
     wchar_t* appData = nullptr;

@@ -325,6 +325,10 @@ void App::drawCompany() {
         f.loaded = true;
         f.name = c.name;
         f.address = c.address;
+        f.email = c.email;
+        f.phone = c.phone;
+        f.invoiceFooter = c.invoiceFooter;
+        f.paperSize = c.paperSize == PaperSize::A4 ? 1 : 0;
         f.fiscalYearStartMonth = c.fiscalYearStartMonth;
         f.terms = std::to_string(c.defaultTermsDays);
         f.nextInvoice = std::to_string(c.nextInvoiceNumber);
@@ -348,6 +352,23 @@ void App::drawCompany() {
     ui::InputString("##name", f.name);
     ui::FormLabel("Address", col);
     ui::InputMultiline("##address", f.address, ImVec2(width, ImGui::GetTextLineHeight() * 3.6f));
+    ui::FormLabel("Email", col);
+    ImGui::SetNextItemWidth(width);
+    ui::InputString("##email", f.email);
+    ui::FormLabel("Phone", col);
+    ImGui::SetNextItemWidth(width);
+    ui::InputString("##phone", f.phone);
+
+    ImGui::Dummy(ImVec2(0, 6));
+    ui::SubHeading("Invoices");
+    ui::FormLabel("Invoice footer", col);
+    ui::InputMultiline("##footer", f.invoiceFooter, ImVec2(width, ImGui::GetTextLineHeight() * 3.6f));
+    ImGui::SetCursorPosX(col + ImGui::GetStyle().WindowPadding.x);
+    ui::Muted("Printed at the bottom of every PDF, e.g. payment instructions.");
+    ui::FormLabel("Paper size", col);
+    ImGui::SetNextItemWidth(width * 0.4f);
+    static const char* kPaper[] = {"Letter", "A4"};
+    ImGui::Combo("##paper", &f.paperSize, kPaper, 2);
 
     ImGui::Dummy(ImVec2(0, 6));
     ui::SubHeading("Accounting");
@@ -399,6 +420,10 @@ void App::drawCompany() {
                         Company& c = book.company;
                         c.name = trim(copy.name);
                         c.address = copy.address;
+                        c.email = trim(copy.email);
+                        c.phone = trim(copy.phone);
+                        c.invoiceFooter = copy.invoiceFooter;
+                        c.paperSize = copy.paperSize == 1 ? PaperSize::A4 : PaperSize::Letter;
                         c.fiscalYearStartMonth = copy.fiscalYearStartMonth;
                         c.defaultTermsDays = static_cast<int>(*terms);
                         c.nextInvoiceNumber = static_cast<int>(*next);

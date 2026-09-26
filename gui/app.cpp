@@ -28,6 +28,19 @@ constexpr float kNoticeSeconds = 6.0f;
 
 fs::path pathFromUtf8(const std::string& s) { return fs::u8path(s); }
 
+// The same file spelled differently (case on Windows, "..", slashes) counts once in Recent.
+bool samePath(const std::string& a, const std::string& b) {
+    std::error_code ec;
+    if (fs::equivalent(fs::u8path(a), fs::u8path(b), ec)) return true;
+    const std::string na = fs::u8path(a).lexically_normal().u8string();
+    const std::string nb = fs::u8path(b).lexically_normal().u8string();
+#ifdef _WIN32
+    return iequals(na, nb);
+#else
+    return na == nb;
+#endif
+}
+
 std::string documentsDirectory() {
     const char* home = std::getenv("USERPROFILE");
     if (!home || !*home) home = std::getenv("HOME");
@@ -79,7 +92,9 @@ void App::loadConfig() {
         const std::string key = line.substr(0, eq);
         const std::string value = line.substr(eq + 1);
         if (key == "theme") darkTheme_ = value == "dark";
-        if (key == "recent" && !value.empty() && recent_.size() < 8) recent_.push_back(value);
+        if (key == "recent" && !value.empty() && recent_.size() < 8 &&
+            std::none_of(recent_.begin(), recent_.end(), [&](const std::string& r) { return samePath(r, value); }))
+            recent_.push_back(value);
     }
 }
 
@@ -90,7 +105,8 @@ void App::saveConfig() const {
 }
 
 void App::rememberRecent(const std::string& path) {
-    recent_.erase(std::remove(recent_.begin(), recent_.end(), path), recent_.end());
+    recent_.erase(std::remove_if(recent_.begin(), recent_.end(), [&](const std::string& r) { return samePath(r, path); }),
+                  recent_.end());
     recent_.insert(recent_.begin(), path);
     if (recent_.size() > 8) recent_.resize(8);
     saveConfig();
