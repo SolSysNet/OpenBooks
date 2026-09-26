@@ -2,8 +2,11 @@
 
 #include "openbooks/book.hpp"
 #include "openbooks/cli.hpp"
+#include "openbooks/invoice_pdf.hpp"
+#include "openbooks/pdf.hpp"
 #include "openbooks/reports.hpp"
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -511,6 +514,183 @@ TEST(storage_rejects_corruption) {
     CHECK_THROWS(Book::read(unknown));
 }
 
+// -------------------------------------------------------------------- PDF
+
+// Checks the file skeleton: header, trailer, and that every xref offset points at its object.
+bool pdfStructureValid(const std::string& pdf, std::string* why) {
+    auto fail = [&](const std::string& m) {
+        if (why) *why = m;
+        return false;
+    };
+    if (pdf.rfind("%PDF-1.4\n", 0) != 0) return fail("bad header");
+    if (pdf.size() < 6 || pdf.compare(pdf.size() - 6, 6, "%%EOF\n") != 0) return fail("bad trailer");
+    const auto sx = pdf.rfind("startxref\n");
+    if (sx == std::string::npos) return fail("no startxref");
+    const std::size_t xref = std::stoul(pdf.substr(sx + 10));
+    if (pdf.compare(xref, 5, "xref\n") != 0) return fail("startxref does not point at xref");
+    std::istringstream in(pdf.substr(xref + 5));
+    std::size_t first = 0, count = 0;
+    in >> first >> count;
+    std::string line;
+    std::getline(in, line);
+    std::getline(in, line);  // free entry 0
+    for (std::size_t n = 1; n < count; ++n) {
+        std::getline(in, line);
+        if (line.size() != 19) return fail("xref entry has wrong length");
+        const std::size_t offset = std::stoul(line.substr(0, 10));
+        const std::string expect = std::to_string(n) + " 0 obj\n";
+        if (pdf.compare(offset, expect.size(), expect) != 0) return fail("xref offset wrong for object " + std::to_string(n));
+    }
+    // Every stream's /Length must match its data.
+    std::size_t pos = 0;
+    while ((pos = pdf.find("/Length ", pos)) != std::string::npos) {
+        const std::size_t length = std::stoul(pdf.substr(pos + 8));
+        const std::size_t data = pdf.find("stream\n", pos) + 7;
+        if (pdf.compare(data + length, 10, "\nendstream") != 0) return fail("stream length mismatch");
+        pos = data + length;
+    }
+    return true;
+}
+
+bool noActiveContent(const std::string& pdf) {
+    for (const char* key : {"/JavaScript", "/JS", "/URI", "/Launch", "/EmbeddedFile", "/OpenAction", "/AA", "/AcroForm",
+                            "/SubmitForm", "/GoToR", "/FontFile"}) {
+        if (pdf.find(key) != std::string::npos) return false;
+    }
+    return true;
+}
+
+TEST(pdf_text_encoding_and_escaping) {
+    CHECK_EQ(pdf::escapeString("a(b)c\\"), std::string("(a\\(b\\)c\\\\)"));
+    CHECK_EQ(pdf::escapeString("\xE9\n"), std::string("(\\351\\012)"));
+    CHECK_EQ(pdf::toWinAnsi("caf\xC3\xA9 \xE2\x82\xAC" "5 \xE2\x80\x94 ok"), std::string("caf\xE9 \x80" "5 \x97 ok"));
+    CHECK_EQ(pdf::toWinAnsi("\xFF"), std::string("?"));
+    CHECK_EQ(pdf::toWinAnsi("\xC3"), std::string("?"));                  // truncated sequence
+    CHECK_EQ(pdf::toWinAnsi("\xF0\x9F\x98\x80!"), std::string("?!"));    // emoji is not in WinAnsi
+    CHECK_EQ(pdf::toWinAnsi("a\tb"), std::string("a b"));
+    CHECK(std::abs(pdf::textWidth("Hello", pdf::Font::Regular, 10) - 22.78) < 1e-9);
+    CHECK(std::abs(pdf::textWidth("Hello", pdf::Font::Bold, 10) - 24.45) < 1e-9);  // H722 e556 l278 l278 o611
+}
+
+TEST(pdf_wrapping) {
+    const std::string text = "The quick brown fox jumps over the lazy dog and keeps running across the field";
+    const auto lines = pdf::wrapText(text, pdf::Font::Regular, 10, 120);
+    CHECK(lines.size() > 1);
+    bool fits = true;
+    for (const auto& l : lines) fits = fits && pdf::textWidth(l, pdf::Font::Regular, 10) <= 120;
+    CHECK(fits);
+    const auto broken = pdf::wrapText(std::string(80, 'W'), pdf::Font::Regular, 10, 100);
+    CHECK(broken.size() > 1);
+    CHECK_EQ(pdf::wrapText("", pdf::Font::Regular, 10, 100).size(), std::size_t(1));
+    CHECK_EQ(pdf::wrapText("one\ntwo", pdf::Font::Regular, 10, 500).size(), std::size_t(2));
+}
+
+TEST(pdf_document_structure) {
+    pdf::Document doc(pdf::kA4);
+    doc.setTitle("Test (1)");
+    doc.addPage().text(50, 700, "Hello", pdf::Font::Bold, 12);
+    doc.addPage().line(0, 0, 100, 100);
+    const std::string out = doc.build();
+    std::string why;
+    CHECK(pdfStructureValid(out, &why));
+    if (!why.empty()) std::cerr << "  " << why << '\n';
+    CHECK(out.find("/Count 2") != std::string::npos);
+    CHECK(out.find("/MediaBox [0 0 595.28 841.89]") != std::string::npos);
+    CHECK(out.find("/Title (Test \\(1\\))") != std::string::npos);
+    CHECK(noActiveContent(out));
+    CHECK_EQ(out, doc.build());  // deterministic
+}
+
+TEST(invoice_pdf_rendering) {
+    Fixture f;
+    f.b.company.name = "Blue Door (Design)";
+    f.b.company.invoiceFooter = "Pay by bank transfer.";
+    Contact evil = f.b.contact(f.acme);
+    evil.name = "Acme ) Tj /F2 99 Tf (Corp";  // attempted content-stream injection
+    f.b.updateContact(evil);
+
+    Document d;
+    d.kind = DocKind::Invoice;
+    d.contactId = f.acme;
+    d.date = D("2026-01-05");
+    d.dueDate = D("2026-02-04");
+    d.memo = "Thanks!";
+    for (int i = 0; i < 45; ++i) {
+        DocLine l;
+        l.accountId = f.service;
+        l.description = "Line " + std::to_string(i) + " with a fairly long description that wraps onto two lines";
+        l.rate = M("10");
+        d.lines.push_back(l);
+    }
+    const int id = f.b.createDocument(d);
+    const std::string out = documentPdf(f.b, id);
+    std::string why;
+    CHECK(pdfStructureValid(out, &why));
+    if (!why.empty()) std::cerr << "  " << why << '\n';
+    CHECK(noActiveContent(out));
+    CHECK(out.find("Tf (Corp") == std::string::npos);        // the injection stayed inside a string
+    CHECK(out.find("Acme \\) Tj /F2 99 Tf \\(Corp") != std::string::npos);
+    CHECK(out.find("/Count 1 ") == std::string::npos);        // multi-page
+    CHECK(out.find("(Page 1 of ") != std::string::npos);
+    CHECK(out.find("(450.00)") != std::string::npos);         // total
+    CHECK(out.find("(PAID)") == std::string::npos);
+
+    f.receive("2026-01-10", M("450"));
+    CHECK(documentPdf(f.b, id).find("(PAID)") != std::string::npos);
+
+    const int small = f.invoice("2026-01-06", M("5"));
+    f.b.voidDocument(small);
+    const std::string voided = documentPdf(f.b, small);
+    CHECK(voided.find("(VOID)") != std::string::npos);
+    CHECK(pdfStructureValid(voided, nullptr));
+}
+
+TEST(invoice_pdf_file_name_is_safe) {
+    Fixture f;
+    Contact c = f.b.contact(f.acme);
+    c.name = "..\\..\\Windows/System32:evil*?";
+    f.b.updateContact(c);
+    Document d;
+    d.kind = DocKind::Invoice;
+    d.contactId = f.acme;
+    d.date = D("2026-01-05");
+    d.dueDate = d.date;
+    d.number = "../../x";
+    DocLine l;
+    l.accountId = f.service;
+    l.rate = M("1");
+    d.lines.push_back(l);
+    const std::string name = documentPdfFileName(f.b, f.b.createDocument(d));
+    CHECK(name.find('/') == std::string::npos);
+    CHECK(name.find('\\') == std::string::npos);
+    CHECK(name.find(':') == std::string::npos);
+    CHECK(name.find('*') == std::string::npos);
+    CHECK(name.front() != '.');
+    CHECK(name.size() > 4 && name.compare(name.size() - 4, 4, ".pdf") == 0);
+}
+
+TEST(company_fields_round_trip_and_old_files_load) {
+    Book b;
+    b.company.email = "a@b.example";
+    b.company.phone = "555";
+    b.company.invoiceFooter = "Line one\nLine two";
+    b.company.paperSize = PaperSize::A4;
+    std::stringstream out;
+    b.write(out);
+    std::stringstream in(out.str());
+    const Book loaded = Book::read(in);
+    CHECK_EQ(loaded.company.invoiceFooter, b.company.invoiceFooter);
+    CHECK(loaded.company.paperSize == PaperSize::A4);
+    CHECK_EQ(loaded.company.email, std::string("a@b.example"));
+
+    // A 0.2 file has only the first eleven COMPANY fields.
+    std::stringstream old("OPENBOOKS\t1\nCOMPANY\tOld Co\t\t1\t30\t\t1001\t0\t0\t0\t0\n");
+    const Book legacy = Book::read(old);
+    CHECK_EQ(legacy.company.name, std::string("Old Co"));
+    CHECK(legacy.company.email.empty());
+    CHECK(legacy.company.paperSize == PaperSize::Letter);
+}
+
 // -------------------------------------------------------------------- CLI
 
 struct CliRun {
@@ -592,6 +772,13 @@ TEST(cli_end_to_end) {
 
     r = cli(file, {"report", "trial-balance", "--csv"});
     CHECK(r.out.find("Account,Debit,Credit") == 0);
+
+    // PDF export refuses to overwrite unless forced.
+    const std::string pdfPath = (dir / "inv.pdf").string();
+    CHECK_EQ(cli(file, {"invoice", "pdf", "1001", "--out", pdfPath}).code, 0);
+    CHECK(fs::file_size(dir / "inv.pdf") > 1000);
+    CHECK_EQ(cli(file, {"invoice", "pdf", "1001", "--out", pdfPath}).code, 1);
+    CHECK_EQ(cli(file, {"invoice", "pdf", "1001", "--out", pdfPath, "--force"}).code, 0);
 
     fs::remove_all(dir);
 }

@@ -160,9 +160,15 @@ struct Payment {
 
 // ----------------------------------------------------------------- Company
 
+enum class PaperSize { Letter, A4 };
+
 struct Company {
     std::string name = "My Company";
     std::string address;
+    std::string email;
+    std::string phone;
+    std::string invoiceFooter;  // e.g. payment instructions, printed at the bottom of invoices
+    PaperSize paperSize = PaperSize::Letter;
     int fiscalYearStartMonth = 1;
     int defaultTermsDays = 30;
     std::optional<Date> closedThrough;  // no changes allowed on or before this date

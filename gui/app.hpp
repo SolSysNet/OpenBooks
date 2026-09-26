@@ -199,6 +199,10 @@ struct CompanyForm {
     bool loaded = false;
     std::string name;
     std::string address;
+    std::string email;
+    std::string phone;
+    std::string invoiceFooter;
+    int paperSize = 0;  // 0 Letter, 1 A4
     int fiscalYearStartMonth = 1;
     std::string terms;
     std::string nextInvoice;

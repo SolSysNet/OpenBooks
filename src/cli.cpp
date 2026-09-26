@@ -2,6 +2,7 @@
 
 #include "openbooks/book.hpp"
 #include "openbooks/import.hpp"
+#include "openbooks/invoice_pdf.hpp"
 #include "openbooks/reports.hpp"
 #include "openbooks/util.hpp"
 
@@ -22,7 +23,7 @@ namespace {
 // ------------------------------------------------------------- arguments
 
 // Options that never take a value.
-const std::set<std::string> kFlags = {"csv", "open", "all", "finish", "empty", "no-header", "negate", "non-taxable",
+const std::set<std::string> kFlags = {"csv", "open", "all", "finish", "empty", "no-header", "negate", "non-taxable", "force",
                                       "help"};
 
 class Args {
@@ -266,6 +267,10 @@ void cmdCompany(Context& c, Args& a) {
         auto role = [&](int id) { return id ? accountLabel(b.account(id)) : std::string("(not set)"); };
         c.out << "Company:               " << co.name << '\n'
               << "Address:               " << co.address << '\n'
+              << "Email:                 " << co.email << '\n'
+              << "Phone:                 " << co.phone << '\n'
+              << "Invoice footer:        " << co.invoiceFooter << '\n'
+              << "Paper size:            " << (co.paperSize == PaperSize::A4 ? "A4" : "Letter") << '\n'
               << "Fiscal year starts:    month " << co.fiscalYearStartMonth << '\n'
               << "Default terms:         Net " << co.defaultTermsDays << '\n'
               << "Books closed through:  " << (co.closedThrough ? co.closedThrough->str() : "(open)") << '\n'
@@ -287,12 +292,24 @@ void cmdCompany(Context& c, Args& a) {
     const auto ap = a.get("ap-account");
     const auto tax = a.get("sales-tax-account");
     const auto re = a.get("retained-earnings-account");
+    const auto email = a.get("email");
+    const auto phone = a.get("phone");
+    const auto footer = a.get("invoice-footer");
+    const auto paper = a.get("paper");
     a.finish();
 
     Book& b = c.modify();
     Company& co = b.company;
     if (name) co.name = trim(*name);
     if (address) co.address = *address;
+    if (email) co.email = trim(*email);
+    if (phone) co.phone = trim(*phone);
+    if (footer) co.invoiceFooter = *footer;
+    if (paper) {
+        if (iequals(trim(*paper), "letter")) co.paperSize = PaperSize::Letter;
+        else if (iequals(trim(*paper), "a4")) co.paperSize = PaperSize::A4;
+        else throw Error("--paper must be letter or a4");
+    }
     if (fy) co.fiscalYearStartMonth = intArg(*fy, "--fiscal-year-start (1-12)", 1, 12);
     if (terms) co.defaultTermsDays = intArg(*terms, "--terms", 0, 3650);
     if (next) co.nextInvoiceNumber = intArg(*next, "--next-invoice", 1, 2000000000);
@@ -500,6 +517,22 @@ void cmdDocument(Context& c, Args& a, DocKind kind) {
         a.finish();
         const Book& b = c.books();
         c.out << renderDocument(b, b.findDocument(kind, ref).id);
+    } else if (sub == "pdf") {
+        const std::string ref = a.positional(1, noun + " number");
+        const auto outPath = a.get("out");
+        const bool force = a.flag("force");
+        a.finish();
+        const Book& b = c.books();
+        const int id = b.findDocument(kind, ref).id;
+        const std::filesystem::path target = std::filesystem::u8path(outPath ? *outPath : documentPdfFileName(b, id));
+        if (std::filesystem::exists(target) && !force)
+            throw Error("'" + target.u8string() + "' already exists; use --force to overwrite it");
+        const std::string bytes = documentPdf(b, id);
+        std::ofstream out(target, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        out.close();
+        if (!out) throw Error("could not write '" + target.u8string() + "'");
+        c.out << "Wrote " << target.u8string() << " (" << bytes.size() / 1024 + 1 << " KB).\n";
     } else if (sub == "void") {
         const std::string ref = a.positional(1, noun + " number");
         a.finish();
@@ -852,7 +885,8 @@ const std::vector<Command>& commands() {
         {"init", "  openbooks init [--company NAME] [--empty]", "Create a new books file (starter chart of accounts unless --empty)", cmdInit},
         {"company",
          "  openbooks company [show]\n"
-         "  openbooks company set [--name N] [--address A] [--fiscal-year-start MONTH] [--terms DAYS]\n"
+         "  openbooks company set [--name N] [--address A] [--email E] [--phone P] [--invoice-footer TEXT]\n"
+         "                        [--paper letter|a4] [--fiscal-year-start MONTH] [--terms DAYS]\n"
          "                        [--next-invoice N] [--close-through DATE|none] [--ar-account A]\n"
          "                        [--ap-account A] [--sales-tax-account A] [--retained-earnings-account A]",
          "Show or change company settings, close the books through a date", cmdCompany},
@@ -886,12 +920,14 @@ const std::vector<Command>& commands() {
          "                           [--number N] [--tax PERCENT] [--memo TEXT]\n"
          "  openbooks invoice list [--open] [--customer C] [--csv]\n"
          "  openbooks invoice show NUMBER\n"
+         "  openbooks invoice pdf NUMBER [--out FILE] [--force]\n"
          "  openbooks invoice void NUMBER",
          "Create, list, print and void invoices", [](Context& c, Args& a) { cmdDocument(c, a, DocKind::Invoice); }},
         {"bill",
          "  openbooks bill create --vendor V --line SPEC [--line SPEC ...] [--date D] [--due D] [--number N] [--memo TEXT]\n"
          "  openbooks bill list [--open] [--vendor V] [--csv]\n"
          "  openbooks bill show NUMBER\n"
+         "  openbooks bill pdf NUMBER [--out FILE] [--force]\n"
          "  openbooks bill void NUMBER",
          "Enter, list and void vendor bills", [](Context& c, Args& a) { cmdDocument(c, a, DocKind::Bill); }},
         {"receive-payment",

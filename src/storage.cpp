@@ -83,6 +83,7 @@ public:
         if (i >= fields_.size()) fail("missing field " + std::to_string(i));
         return fields_[i];
     }
+    std::string optional(std::size_t i) const { return i < fields_.size() ? fields_[i] : std::string(); }
     int integer(std::size_t i) const {
         const auto v = parseInt(str(i));
         if (!v || *v < INT_MIN || *v > INT_MAX) fail("invalid number '" + str(i) + "'");
@@ -162,7 +163,8 @@ void Book::write(std::ostream& out) const {
     record(out, {"COMPANY", c.name, c.address, num(c.fiscalYearStartMonth), num(c.defaultTermsDays),
                  c.closedThrough ? c.closedThrough->str() : "", num(c.nextInvoiceNumber),
                  num(c.receivablesAccountId), num(c.payablesAccountId), num(c.salesTaxAccountId),
-                 num(c.retainedEarningsAccountId)});
+                 num(c.retainedEarningsAccountId), c.email, c.phone, c.invoiceFooter,
+                 c.paperSize == PaperSize::A4 ? "a4" : "letter"});
     for (const auto& a : accounts_)
         record(out, {"ACCOUNT", num(a.id), a.number, a.name, toString(a.type), a.description, flag(a.active)});
     for (const auto& k : contacts_)
@@ -227,6 +229,14 @@ Book Book::read(std::istream& in) {
             c.payablesAccountId = f.integer(8);
             c.salesTaxAccountId = f.integer(9);
             c.retainedEarningsAccountId = f.integer(10);
+            // Added in 0.3; absent in older files.
+            c.email = f.optional(11);
+            c.phone = f.optional(12);
+            c.invoiceFooter = f.optional(13);
+            const std::string paper = f.optional(14);
+            if (paper.empty() || paper == "letter") c.paperSize = PaperSize::Letter;
+            else if (paper == "a4") c.paperSize = PaperSize::A4;
+            else f.fail("invalid paper size '" + paper + "'");
         } else if (type == "ACCOUNT") {
             Account a;
             a.id = f.integer(1);

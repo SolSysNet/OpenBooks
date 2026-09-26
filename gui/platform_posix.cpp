@@ -14,6 +14,9 @@ std::optional<std::string> saveFileDialog(const char*, FileFilter, const char*, 
 
 bool nativeFileDialogsAvailable() { return false; }
 
+// Not implemented yet on Linux/macOS (would shell out to xdg-open / open).
+bool openWithDefaultApp(const std::string&) { return false; }
+
 std::string configDirectory() {
     std::filesystem::path dir;
     if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg && *xdg) {

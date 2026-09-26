@@ -3,6 +3,7 @@
 #include "app.hpp"
 
 #include "imgui.h"
+#include "openbooks/invoice_pdf.hpp"
 #include "openbooks/util.hpp"
 #include "platform.hpp"
 #include "theme.hpp"
@@ -527,16 +528,35 @@ void App::drawDocumentDetail(int documentId) {
         ImGui::SetClipboardText(renderDocument(b, doc.id).c_str());
         notify("Copied to clipboard");
     }
+    auto writePdf = [&](const std::filesystem::path& target) {
+        const std::string bytes = documentPdf(b, doc.id);
+        std::ofstream out(target, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        out.close();
+        return static_cast<bool>(out);
+    };
     ImGui::SameLine();
-    if (nativeFileDialogsAvailable() && ImGui::Button("Save as text...")) {
-        const std::string name = std::string(invoice ? "Invoice " : "Bill ") + doc.number + ".txt";
-        if (auto path = saveFileDialog("Save document", {"Text files (*.txt)", "*.txt"}, "txt", name)) {
-            std::ofstream out(std::filesystem::u8path(*path), std::ios::binary);
-            out << renderDocument(b, doc.id);
-            if (out) notify("Saved " + *path);
+    if (ImGui::Button("Save PDF...")) {
+        const std::string name = documentPdfFileName(b, doc.id);
+        std::optional<std::string> path;
+        if (nativeFileDialogsAvailable()) path = saveFileDialog("Save PDF", {"PDF files (*.pdf)", "*.pdf"}, "pdf", name);
+        else path = (std::filesystem::u8path(path_).parent_path() / std::filesystem::u8path(name)).u8string();
+        if (path) {
+            if (writePdf(std::filesystem::u8path(*path))) notify("Saved " + *path);
             else notify("Could not write " + *path, true);
         }
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Preview PDF")) {
+        // Written to a private temp folder and opened in the local default PDF viewer.
+        std::error_code ec;
+        const auto dir = std::filesystem::temp_directory_path(ec) / "OpenBooks";
+        std::filesystem::create_directories(dir, ec);
+        const auto target = dir / std::filesystem::u8path(documentPdfFileName(b, doc.id));
+        if (!writePdf(target)) notify("Could not write " + target.u8string(), true);
+        else if (!openWithDefaultApp(target.u8string())) notify("Saved preview to " + target.u8string());
+    }
+    ImGui::SetItemTooltip("Open in your PDF viewer to check or print");
     if (!doc.voided) {
         ImGui::SameLine();
         if (ImGui::Button("Void")) {

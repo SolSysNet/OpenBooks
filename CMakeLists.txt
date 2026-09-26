@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(OpenBooks VERSION 0.2.0 LANGUAGES CXX)
+project(OpenBooks VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,6 +25,8 @@ add_library(openbooks_core
     src/book.cpp
     src/storage.cpp
     src/import.cpp
+    src/pdf.cpp
+    src/invoice_pdf.cpp
     src/reports.cpp
     src/cli.cpp
 )
@@ -71,6 +73,9 @@ if(OPENBOOKS_BUILD_GUI)
         ${IMGUI_DIR}/misc/imgui_stdlib.cpp
     )
     target_include_directories(imgui PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends ${IMGUI_DIR}/misc)
+    # Hardening: remove ImGui's built-in "open URL/file in shell" handler (ShellExecute / system())
+    # so no widget can ever launch a URL or command, and drop deprecated APIs.
+    target_compile_definitions(imgui PUBLIC IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
 
     set(OPENBOOKS_GUI_SOURCES
         gui/app.cpp
