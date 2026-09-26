@@ -4,6 +4,7 @@
 
 #include "imgui.h"
 #include "openbooks/invoice_pdf.hpp"
+#include "openbooks/reports.hpp"
 #include "openbooks/util.hpp"
 #include "platform.hpp"
 #include "theme.hpp"
@@ -19,19 +20,6 @@ namespace obgui {
 using namespace ob;
 
 namespace {
-
-struct Status {
-    const char* label;
-    ImVec4 color;
-};
-
-Status documentStatus(const Document& d, Money balance, Date today) {
-    if (d.voided) return {"Void", colorMuted()};
-    if (balance.isZero()) return {"Paid", colorPositive()};
-    if (d.dueDate < today) return {"Overdue", colorNegative()};
-    if (balance < d.total()) return {"Partial", colorWarning()};
-    return {"Open", colorAccent()};
-}
 
 Money lookup(const std::unordered_map<int, Money>& m, int id) {
     const auto it = m.find(id);
@@ -282,505 +270,42 @@ void App::drawContacts(ContactKind kind) {
     if (ImGui::Button("Close")) st.selectedId = 0;
 
     ImGui::Dummy(ImVec2(0, 6));
-    ui::SubHeading(customers ? "Invoices" : "Bills");
-    const DocKind docKind = customers ? DocKind::Invoice : DocKind::Bill;
-    if (ImGui::BeginTable("##contactDocs", 5, kListFlags, ImVec2(0, 0))) {
+    ui::SubHeading("Documents");
+    if (ImGui::BeginTable("##contactDocs", 6, kListFlags, ImVec2(0, 0))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Number");
-        ImGui::TableSetupColumn("Date");
-        ImGui::TableSetupColumn("Total", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.5f);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.5f);
+        ImGui::TableSetupColumn("Number", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 4.5f);
+        ImGui::TableSetupColumn("Date", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.0f);
+        ImGui::TableSetupColumn("Total", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Balance", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.5f);
-        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 5.0f);
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.0f);
         ImGui::TableHeadersRow();
+        int openId = 0;
         const auto& docs = b.documents();
         for (auto it = docs.rbegin(); it != docs.rend(); ++it) {
             const Document& doc = *it;
-            if (doc.kind != docKind || doc.contactId != c.id) continue;
-            const Money bal = lookup(d.documentBalance, doc.id);
+            if (doc.contactId != c.id) continue;
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
             ImGui::PushID(doc.id);
-            if (ImGui::Selectable(doc.number.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
-                (customers ? invoices_ : bills_).selectedId = doc.id;
-                go(customers ? Screen::Invoices : Screen::Bills);
-            }
+            if (ImGui::Selectable(docTitle(doc.kind), false, ImGuiSelectableFlags_SpanAllColumns)) openId = doc.id;
             ImGui::PopID();
             ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(doc.number.c_str());
+            ImGui::TableSetColumnIndex(2);
             ImGui::TextUnformatted(doc.date.str().c_str());
-            ImGui::TableSetColumnIndex(2);
+            ImGui::TableSetColumnIndex(3);
             ui::MoneyText(doc.voided ? Money() : doc.total());
-            ImGui::TableSetColumnIndex(3);
-            ui::MoneyText(bal);
             ImGui::TableSetColumnIndex(4);
-            const Status s = documentStatus(doc, bal, today);
-            ImGui::TextColored(s.color, "%s", s.label);
+            ui::MoneyText(lookup(d.documentBalance, doc.id));
+            ImGui::TableSetColumnIndex(5);
+            const std::string status = documentStatus(b, doc, today);
+            ImGui::TextColored(ui::statusColor(status), "%s", status.c_str());
         }
         ImGui::EndTable();
+        if (openId) openDocument(openId);
     }
     ImGui::EndChild();
-}
-
-// ------------------------------------------------------ invoices and bills
-
-void App::drawDocuments(DocKind kind) {
-    const bool invoices = kind == DocKind::Invoice;
-    ListState& st = invoices ? invoices_ : bills_;
-    const Book& b = *book_;
-    const Derived& d = derived();
-    const Date today = Date::today();
-
-    ui::Heading(invoices ? "Invoices" : "Bills");
-    static const char* kFilters[] = {"All", "Open", "Overdue", "Paid", "Void"};
-    for (int i = 0; i < 5; ++i) {
-        if (i) ImGui::SameLine(0, 2);
-        const bool active = st.filter == i;
-        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
-        if (ImGui::Button(kFilters[i])) st.filter = i;
-        if (active) ImGui::PopStyleColor();
-    }
-    ImGui::SameLine(0, 16);
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
-    ui::InputStringHint("##search", invoices ? "Search number or customer" : "Search number or vendor", st.search);
-    const char* newLabel = invoices ? "New invoice" : "Enter bill";
-    rightAlignedButtons(buttonWidth(newLabel));
-    if (ui::PrimaryButton(newLabel)) startDocument(kind, 0, invoices ? Screen::Invoices : Screen::Bills);
-    ImGui::Dummy(ImVec2(0, 4));
-
-    bool selectionVisible = false;
-    for (const auto& doc : b.documents()) {
-        if (doc.id == st.selectedId && doc.kind == kind) selectionVisible = true;
-    }
-    if (!selectionVisible) st.selectedId = 0;
-    const float listWidth = st.selectedId ? ImGui::GetContentRegionAvail().x * 0.52f : 0.0f;
-
-    Money totalShown;
-    Money openShown;
-    ImGui::BeginGroup();
-    const bool compact = st.selectedId != 0;  // detail panel open: hide Due and Total
-    if (ImGui::BeginTable(compact ? "##docsCompact" : "##docs", 7, kListFlags | ImGuiTableFlags_Hideable,
-                          ImVec2(listWidth, -ImGui::GetFrameHeightWithSpacing()))) {
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Number", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 5.5f);
-        ImGui::TableSetupColumn("Date", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.0f);
-        ImGui::TableSetupColumn("Due", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.0f);
-        ImGui::TableSetupColumn(invoices ? "Customer" : "Vendor", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Total", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.5f);
-        ImGui::TableSetupColumn("Balance", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.5f);
-        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 5.0f);
-        ImGui::TableSetColumnEnabled(2, !compact);
-        ImGui::TableSetColumnEnabled(4, !compact);
-        ImGui::TableHeadersRow();
-
-        std::vector<const Document*> rows;
-        for (const auto& doc : b.documents()) {
-            if (doc.kind != kind) continue;
-            const Money bal = lookup(d.documentBalance, doc.id);
-            const Status s = documentStatus(doc, bal, today);
-            const std::string label = s.label;
-            const bool keep = st.filter == 0 || (st.filter == 1 && !doc.voided && !bal.isZero()) ||
-                              (st.filter == 2 && label == "Overdue") || (st.filter == 3 && label == "Paid") ||
-                              (st.filter == 4 && doc.voided);
-            if (!keep || !matches(doc.number + " " + b.contact(doc.contactId).name, st.search)) continue;
-            rows.push_back(&doc);
-        }
-        std::stable_sort(rows.begin(), rows.end(), [](const Document* x, const Document* y) {
-            return x->date != y->date ? x->date > y->date : x->id > y->id;
-        });
-        ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(rows.size()));
-        while (clipper.Step()) {
-            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-                const Document& doc = *rows[static_cast<std::size_t>(i)];
-                const Money bal = lookup(d.documentBalance, doc.id);
-                const Status s = documentStatus(doc, bal, today);
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                ImGui::PushID(doc.id);
-                if (ImGui::Selectable(doc.number.c_str(), st.selectedId == doc.id, ImGuiSelectableFlags_SpanAllColumns))
-                    st.selectedId = st.selectedId == doc.id ? 0 : doc.id;
-                ImGui::PopID();
-                ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(doc.date.str().c_str());
-                ImGui::TableSetColumnIndex(2);
-                if (s.label == std::string("Overdue")) ImGui::TextColored(colorNegative(), "%s", doc.dueDate.str().c_str());
-                else ImGui::TextUnformatted(doc.dueDate.str().c_str());
-                ImGui::TableSetColumnIndex(3);
-                ImGui::TextUnformatted(b.contact(doc.contactId).name.c_str());
-                ImGui::TableSetColumnIndex(4);
-                ui::MoneyText(doc.voided ? Money() : doc.total());
-                ImGui::TableSetColumnIndex(5);
-                ui::MoneyText(bal);
-                ImGui::TableSetColumnIndex(6);
-                ui::Badge(s.label, s.color);
-            }
-        }
-        for (const Document* doc : rows) {
-            if (!doc->voided) totalShown += doc->total();
-            openShown += lookup(d.documentBalance, doc->id);
-        }
-        if (rows.empty()) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(3);
-            ui::Muted(invoices ? "No invoices match." : "No bills match.");
-        }
-        ImGui::EndTable();
-    }
-    ImGui::AlignTextToFramePadding();
-    ImGui::Text("Total %s    Open %s", totalShown.formatted().c_str(), openShown.formatted().c_str());
-    ImGui::EndGroup();
-
-    if (st.selectedId) {
-        ImGui::SameLine();
-        drawDocumentDetail(st.selectedId);
-    }
-}
-
-void App::drawDocumentDetail(int documentId) {
-    const Book& b = *book_;
-    const Derived& d = derived();
-    const Document doc = b.document(documentId);  // copy: actions below may change the books
-    const bool invoice = doc.kind == DocKind::Invoice;
-    const Contact& c = b.contact(doc.contactId);
-    const Money bal = lookup(d.documentBalance, doc.id);
-    const Status s = documentStatus(doc, bal, Date::today());
-
-    ImGui::BeginChild("##docDetail", ImVec2(0, 0), ImGuiChildFlags_Borders);
-    ui::Heading((std::string(invoice ? "Invoice " : "Bill ") + doc.number).c_str());
-    ImGui::SameLine();
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 6);
-    ui::Badge(s.label, s.color);
-
-    const float col = ImGui::GetFontSize() * 6.0f;
-    ui::FormLabel(invoice ? "Customer" : "Vendor", col);
-    ImGui::TextUnformatted(c.name.c_str());
-    ui::FormLabel("Date", col);
-    ImGui::TextUnformatted(doc.date.str().c_str());
-    ui::FormLabel("Due", col);
-    ImGui::TextUnformatted(doc.dueDate.str().c_str());
-    if (!doc.memo.empty()) {
-        ui::FormLabel("Memo", col);
-        ImGui::TextUnformatted(doc.memo.c_str());
-    }
-    ImGui::Dummy(ImVec2(0, 4));
-
-    if (ImGui::BeginTable("##lines", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter)) {
-        ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 3.5f);
-        ImGui::TableSetupColumn("Rate", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.0f);
-        ImGui::TableSetupColumn("Amount", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.5f);
-        ImGui::TableHeadersRow();
-        for (const auto& l : doc.lines) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(l.description.c_str());
-            ImGui::SetItemTooltip("%s", ui::accountName(b, l.accountId).c_str());
-            ImGui::TableSetColumnIndex(1);
-            ui::TextRight(l.quantity.str().c_str());
-            ImGui::TableSetColumnIndex(2);
-            ui::MoneyText(l.rate);
-            ImGui::TableSetColumnIndex(3);
-            ui::MoneyText(l.amount);
-        }
-        ImGui::EndTable();
-    }
-    auto totalLine = [&](const char* label, Money amount, bool bold) {
-        const float x = ImGui::GetContentRegionAvail().x - ImGui::GetFontSize() * 14.0f;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, x));
-        if (bold) ImGui::PushFont(g_fonts.bold, 0.0f);
-        ImGui::TextUnformatted(label);
-        ImGui::SameLine();
-        ui::MoneyText(amount);
-        if (bold) ImGui::PopFont();
-    };
-    totalLine("Subtotal", doc.subtotal(), false);
-    if (!doc.tax().isZero()) totalLine(("Sales tax (" + doc.taxRate.str() + "%)").c_str(), doc.tax(), false);
-    totalLine("Total", doc.total(), true);
-    const Money paid = b.documentPaid(doc.id);
-    if (!paid.isZero()) totalLine("Payments", -paid, false);
-    totalLine("Balance due", bal, true);
-
-    if (!paid.isZero()) {
-        ImGui::Dummy(ImVec2(0, 4));
-        ui::Muted("Payments applied");
-        for (const auto& p : b.payments()) {
-            if (p.voided) continue;
-            for (const auto& a : p.applications) {
-                if (a.documentId == doc.id)
-                    ImGui::BulletText("%s  payment #%d  %s", p.date.str().c_str(), p.id, a.amount.formatted().c_str());
-            }
-        }
-    }
-
-    ImGui::Dummy(ImVec2(0, 8));
-    if (!doc.voided && !bal.isZero()) {
-        if (ui::PrimaryButton(invoice ? "Receive payment" : "Pay bill")) {
-            startPayment(invoice ? PaymentKind::Received : PaymentKind::Paid, doc.contactId);
-            PaymentFormState& f = invoice ? receiveForm_ : payForm_;
-            f.selected.clear();
-            f.applied.clear();
-            f.selected[doc.id] = true;
-            f.applied[doc.id] = bal.str();
-            f.amount = bal.str();
-        }
-        ImGui::SameLine();
-    }
-    if (ImGui::Button("Copy as text")) {
-        ImGui::SetClipboardText(renderDocument(b, doc.id).c_str());
-        notify("Copied to clipboard");
-    }
-    auto writePdf = [&](const std::filesystem::path& target) {
-        const std::string bytes = documentPdf(b, doc.id);
-        std::ofstream out(target, std::ios::binary | std::ios::trunc);
-        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        out.close();
-        return static_cast<bool>(out);
-    };
-    ImGui::SameLine();
-    if (ImGui::Button("Save PDF...")) {
-        const std::string name = documentPdfFileName(b, doc.id);
-        std::optional<std::string> path;
-        if (nativeFileDialogsAvailable()) path = saveFileDialog("Save PDF", {"PDF files (*.pdf)", "*.pdf"}, "pdf", name);
-        else path = (std::filesystem::u8path(path_).parent_path() / std::filesystem::u8path(name)).u8string();
-        if (path) {
-            if (writePdf(std::filesystem::u8path(*path))) notify("Saved " + *path);
-            else notify("Could not write " + *path, true);
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Preview PDF")) {
-        // Written to a private temp folder and opened in the local default PDF viewer.
-        std::error_code ec;
-        const auto dir = std::filesystem::temp_directory_path(ec) / "OpenBooks";
-        std::filesystem::create_directories(dir, ec);
-        const auto target = dir / std::filesystem::u8path(documentPdfFileName(b, doc.id));
-        if (!writePdf(target)) notify("Could not write " + target.u8string(), true);
-        else if (!openWithDefaultApp(target.u8string())) notify("Saved preview to " + target.u8string());
-    }
-    ImGui::SetItemTooltip("Open in your PDF viewer to check or print");
-    if (!doc.voided) {
-        ImGui::SameLine();
-        if (ImGui::Button("Void")) {
-            const int id = doc.id;
-            confirm(std::string("Void ") + (invoice ? "invoice " : "bill ") + doc.number + "?",
-                    "The document stays on file marked VOID and no longer affects any balance. "
-                    "If payments are applied, void them first.",
-                    "Void", [this, id, invoice, number = doc.number] {
-                        commit([id](Book& book) { book.voidDocument(id); }, nullptr,
-                               std::string(invoice ? "Invoice " : "Bill ") + number + " voided");
-                    });
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Close")) (invoice ? invoices_ : bills_).selectedId = 0;
-    ImGui::EndChild();
-}
-
-// ---------------------------------------------------------- document editor
-
-void App::startDocument(DocKind kind, int contactId, Screen returnTo) {
-    editor_ = DocumentEditorState{};
-    editor_.kind = kind;
-    editor_.contactId = contactId;
-    editor_.date = Date::today();
-    editor_.returnTo = returnTo;
-    editor_.lines.resize(1);
-    int terms = book_->company.defaultTermsDays;
-    if (contactId) {
-        const Contact& c = book_->contact(contactId);
-        if (c.termsDays >= 0) terms = c.termsDays;
-    }
-    editor_.dueDate = editor_.date.addDays(terms);
-    go(Screen::DocumentEditor);
-}
-
-void App::drawDocumentEditor() {
-    DocumentEditorState& e = editor_;
-    const Book& b = *book_;
-    const bool invoice = e.kind == DocKind::Invoice;
-    const ContactKind partyKind = invoice ? ContactKind::Customer : ContactKind::Vendor;
-
-    ui::Heading(invoice ? "New Invoice" : "Enter Bill");
-    ImGui::Dummy(ImVec2(0, 4));
-
-    auto recomputeDue = [&] {
-        if (e.dueDateEdited) return;
-        int terms = b.company.defaultTermsDays;
-        if (e.contactId) {
-            const Contact& c = b.contact(e.contactId);
-            if (c.termsDays >= 0) terms = c.termsDays;
-        }
-        e.dueDate = e.date.addDays(terms);
-    };
-
-    const float col = ImGui::GetFontSize() * 6.5f;
-    const float fieldWidth = ImGui::GetFontSize() * 18.0f;
-    if (ImGui::BeginTable("##header", 2, ImGuiTableFlags_SizingStretchSame)) {
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        ui::FormLabel(invoice ? "Customer" : "Vendor", col);
-        if (ui::ContactCombo("##contact", b, partyKind, e.contactId, fieldWidth)) recomputeDue();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("+")) openContactForm(partyKind, 0);
-        ImGui::SetItemTooltip(invoice ? "Add a new customer" : "Add a new vendor");
-        ui::FormLabel(invoice ? "Invoice #" : "Bill #", col);
-        ImGui::SetNextItemWidth(fieldWidth);
-        ui::InputStringHint("##number", invoice ? "Automatic" : "Vendor's invoice number (optional)", e.number);
-        ui::FormLabel("Memo", col);
-        ImGui::SetNextItemWidth(fieldWidth);
-        ui::InputString("##memo", e.memo);
-
-        ImGui::TableSetColumnIndex(1);
-        ui::FormLabel("Date", col);
-        if (ui::DateField("##date", e.date)) recomputeDue();
-        ui::FormLabel("Due date", col);
-        if (ui::DateField("##due", e.dueDate)) e.dueDateEdited = true;
-        if (invoice) {
-            ui::FormLabel("Sales tax %", col);
-            ui::DecimalField("##tax", e.taxRate, ImGui::GetFontSize() * 5.0f);
-        }
-        ImGui::EndTable();
-    }
-    ImGui::Dummy(ImVec2(0, 6));
-
-    // ---- lines
-    const int columns = invoice ? 8 : 7;
-    const ImGuiTableFlags lineFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersInnerV |
-                                      ImGuiTableFlags_Resizable;
-    int removeLine = -1;
-    if (ImGui::BeginTable("##lines", columns, lineFlags)) {
-        ImGui::TableSetupColumn("Product / service", ImGuiTableColumnFlags_WidthStretch, 1.2f);
-        ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthStretch, 1.8f);
-        ImGui::TableSetupColumn(invoice ? "Income account" : "Expense account", ImGuiTableColumnFlags_WidthStretch, 1.4f);
-        ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 4.0f);
-        ImGui::TableSetupColumn("Rate", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.0f);
-        if (invoice) ImGui::TableSetupColumn("Tax", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 2.2f);
-        ImGui::TableSetupColumn("Amount", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.5f);
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
-        ImGui::TableHeadersRow();
-
-        const ui::AccountFilter lineAccounts = [&b](const Account& a) { return !b.isSubledgerAccount(a.id); };
-        for (std::size_t i = 0; i < e.lines.size(); ++i) {
-            LineDraft& l = e.lines[i];
-            ImGui::PushID(static_cast<int>(i));
-            ImGui::TableNextRow();
-            int col_ = 0;
-            ImGui::TableSetColumnIndex(col_++);
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ui::ItemCombo("##item", b, l.itemId) && l.itemId) {
-                const Item& item = b.item(l.itemId);
-                l.description = item.description.empty() ? item.name : item.description;
-                l.rate = item.price.str();
-                const int acct = invoice ? item.incomeAccountId : item.expenseAccountId;
-                if (acct) l.accountId = acct;
-                l.taxable = item.taxable;
-            }
-            ImGui::TableSetColumnIndex(col_++);
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            ui::InputString("##desc", l.description);
-            ImGui::TableSetColumnIndex(col_++);
-            ui::AccountCombo("##acct", b, l.accountId, lineAccounts, nullptr, -FLT_MIN);
-            ImGui::TableSetColumnIndex(col_++);
-            ui::DecimalField("##qty", l.quantity, -FLT_MIN);
-            ImGui::TableSetColumnIndex(col_++);
-            ui::MoneyField("##rate", l.rate, -FLT_MIN);
-            if (invoice) {
-                ImGui::TableSetColumnIndex(col_++);
-                ImGui::Checkbox("##taxable", &l.taxable);
-            }
-            ImGui::TableSetColumnIndex(col_++);
-            const auto q = trim(l.quantity).empty() ? std::optional<Decimal>(Decimal::fromInt(1)) : ui::parseDecimal(l.quantity);
-            const auto r = ui::parseMoney(l.rate);
-            ImGui::AlignTextToFramePadding();
-            if (q && r) ui::MoneyText(multiply(*r, *q));
-            ImGui::TableSetColumnIndex(col_++);
-            if (ImGui::Button("x", ImVec2(ImGui::GetFrameHeight(), 0))) removeLine = static_cast<int>(i);
-            ImGui::SetItemTooltip("Remove line");
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
-    if (removeLine >= 0) {
-        e.lines.erase(e.lines.begin() + removeLine);
-        if (e.lines.empty()) e.lines.resize(1);
-    }
-    if (ImGui::Button("+ Add line")) e.lines.emplace_back();
-
-    // ---- build the document & totals preview
-    Document doc;
-    doc.kind = e.kind;
-    doc.contactId = e.contactId;
-    doc.date = e.date;
-    doc.dueDate = e.dueDate;
-    doc.number = e.number;
-    doc.memo = e.memo;
-    std::string problem;
-    if (invoice && !trim(e.taxRate).empty()) {
-        if (auto t = ui::parseDecimal(e.taxRate)) doc.taxRate = *t;
-        else problem = "Sales tax must be a percentage, e.g. 8.25.";
-    }
-    for (std::size_t i = 0; i < e.lines.size(); ++i) {
-        const LineDraft& l = e.lines[i];
-        const bool blank = l.itemId == 0 && trim(l.description).empty() && trim(l.rate).empty();
-        if (blank) continue;
-        const std::string where = "Line " + std::to_string(i + 1) + ": ";
-        DocLine line;
-        line.itemId = l.itemId;
-        line.description = trim(l.description);
-        line.accountId = l.accountId;
-        line.taxable = invoice && l.taxable;
-        const auto q = trim(l.quantity).empty() ? std::optional<Decimal>(Decimal::fromInt(1)) : ui::parseDecimal(l.quantity);
-        const auto r = ui::parseMoney(l.rate);
-        if (!q && problem.empty()) problem = where + "quantity is not a number.";
-        if (!r && problem.empty()) problem = where + "enter a rate.";
-        if (!l.accountId && problem.empty()) problem = where + "choose an account.";
-        if (q) line.quantity = *q;
-        if (r) line.rate = *r;
-        line.amount = multiply(line.rate, line.quantity);
-        if (line.description.empty() && l.accountId) line.description = ui::accountName(b, l.accountId);
-        doc.lines.push_back(line);
-    }
-
-    const float totalsX = ImGui::GetContentRegionAvail().x - ImGui::GetFontSize() * 15.0f;
-    auto totalRow = [&](const char* label, Money m, bool bold) {
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, totalsX));
-        if (bold) ImGui::PushFont(g_fonts.bold, kBaseFontSize * 1.15f);
-        ImGui::TextUnformatted(label);
-        ImGui::SameLine();
-        ui::MoneyText(m);
-        if (bold) ImGui::PopFont();
-    };
-    totalRow("Subtotal", doc.subtotal(), false);
-    if (invoice) totalRow("Sales tax", doc.tax(), false);
-    totalRow("Total", doc.total(), true);
-
-    ImGui::Dummy(ImVec2(0, 8));
-    ui::ErrorText(e.error);
-    auto save = [&](bool andNew) {
-        if (e.contactId == 0) {
-            e.error = invoice ? "Choose a customer." : "Choose a vendor.";
-            return;
-        }
-        if (!problem.empty()) {
-            e.error = problem;
-            return;
-        }
-        int id = 0;
-        if (!commit([&](Book& book) { id = book.createDocument(doc); }, &e.error)) return;
-        const Document& saved = book_->document(id);
-        notify(std::string(invoice ? "Created invoice " : "Entered bill ") + saved.number + " for " +
-               saved.total().formatted());
-        if (andNew) {
-            startDocument(e.kind, 0, e.returnTo);
-        } else {
-            (invoice ? invoices_ : bills_).selectedId = id;
-            go(invoice ? Screen::Invoices : Screen::Bills);
-        }
-    };
-    if (ui::PrimaryButton("Save")) save(false);
-    ImGui::SameLine();
-    if (ImGui::Button("Save and new")) save(true);
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel")) go(e.returnTo);
 }
 
 // ----------------------------------------------------------------- payments

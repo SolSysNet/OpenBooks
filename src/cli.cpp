@@ -209,7 +209,7 @@ DocLine parseLineSpec(const Book& b, DocKind kind, const std::string& spec) {
         line.itemId = item.id;
         line.description = item.description.empty() ? item.name : item.description;
         line.rate = item.price;
-        line.accountId = kind == DocKind::Invoice ? item.incomeAccountId : item.expenseAccountId;
+        line.accountId = kind == DocKind::Bill ? item.expenseAccountId : item.incomeAccountId;
         line.taxable = item.taxable;
     }
     if (kv.count("desc")) line.description = kv["desc"];
@@ -230,14 +230,13 @@ DocLine parseLineSpec(const Book& b, DocKind kind, const std::string& spec) {
         throw Error("line \"" + spec + "\" needs item=, rate= or amount=");
     if (line.accountId == 0)
         throw Error("line \"" + spec + "\" needs account= (the item has no " +
-                    (kind == DocKind::Invoice ? "income" : "expense") + " account)");
+                    (kind == DocKind::Bill ? "expense" : "income") + " account)");
     if (line.description.empty()) line.description = b.account(line.accountId).name;
     return line;
 }
 
 void print(Context& c, const Table& t, bool csv) { c.out << (csv ? renderCsv(t) : renderText(t)); }
 
-ContactKind partyKind(DocKind k) { return k == DocKind::Invoice ? ContactKind::Customer : ContactKind::Vendor; }
 const char* partyNoun(ContactKind k) { return k == ContactKind::Customer ? "customer" : "vendor"; }
 
 // --------------------------------------------------------------- commands
@@ -463,24 +462,68 @@ void cmdItem(Context& c, Args& a) {
     }
 }
 
+Decimal taxArg(const std::string& text) {
+    std::string rate = trim(text);
+    if (!rate.empty() && rate.back() == '%') rate.pop_back();
+    const auto r = Decimal::parse(rate);
+    if (!r) throw Error("invalid --tax '" + text + "' (a percentage such as 8.25)");
+    return *r;
+}
+
+void writePdfFile(Context& c, const Book& b, int documentId, const std::optional<std::string>& outPath, bool force) {
+    const std::filesystem::path target = std::filesystem::u8path(outPath ? *outPath : documentPdfFileName(b, documentId));
+    if (std::filesystem::exists(target) && !force)
+        throw Error("'" + target.u8string() + "' already exists; use --force to overwrite it");
+    const std::string bytes = documentPdf(b, documentId);
+    std::ofstream out(target, std::ios::binary | std::ios::trunc);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    out.close();
+    if (!out) throw Error("could not write '" + target.u8string() + "'");
+    c.out << "Wrote " << target.u8string() << " (" << bytes.size() / 1024 + 1 << " KB).\n";
+}
+
+// Applies a credit memo to "INVOICE[=AMOUNT]"; without an amount, as much as both allow.
+void applyCreditSpec(Book& b, int creditMemoId, const std::string& spec, std::ostream& out) {
+    const auto eq = spec.rfind('=');
+    const Document& inv = b.findDocument(DocKind::Invoice, trim(eq == std::string::npos ? spec : spec.substr(0, eq)));
+    const int invoiceId = inv.id;
+    Money amount;
+    if (eq == std::string::npos) {
+        const Money owed = b.documentBalance(invoiceId);
+        const Money credit = b.documentBalance(creditMemoId);
+        amount = owed < credit ? owed : credit;
+    } else {
+        amount = positiveMoneyArg(spec.substr(eq + 1), "applied amount");
+    }
+    b.applyCredit(creditMemoId, invoiceId, amount);
+    out << "  applied " << amount.formatted() << " to invoice " << b.document(invoiceId).number << " (remaining "
+        << b.documentBalance(invoiceId).formatted() << ")\n";
+}
+
 void cmdDocument(Context& c, Args& a, DocKind kind) {
-    const bool invoice = kind == DocKind::Invoice;
-    const std::string noun = invoice ? "invoice" : "bill";
+    const std::string noun = docNoun(kind);
     const ContactKind party = partyKind(kind);
     const std::string partyOpt = partyNoun(party);
-    const std::string sub = a.positional(0, "subcommand (create, list, show, void)");
+    const std::string sub = a.positional(0, "subcommand");
 
     if (sub == "create") {
         const std::string who = a.require(partyOpt);
         const auto dateText = a.get("date");
-        const auto dueText = a.get("due");
+        std::optional<std::string> dueText;
+        if (kind == DocKind::Estimate) dueText = a.get("expires");
+        else if (docHasDueDate(kind)) dueText = a.get("due");
         const auto number = a.get("number");
         const auto memo = a.get("memo");
         std::optional<std::string> tax;
-        if (invoice) tax = a.get("tax");
+        if (kind != DocKind::Bill) tax = a.get("tax");
+        std::optional<std::string> deposit;
+        if (kind == DocKind::SalesReceipt) deposit = a.require("deposit-to");
+        std::vector<std::string> applies;
+        if (kind == DocKind::CreditMemo) applies = a.getAll("apply");
         const auto specs = a.getAll("line");
         a.finish();
-        if (specs.empty()) throw Error("at least one --line is required, e.g. --line \"desc=Consulting;qty=2;rate=100;account=Service Revenue\"");
+        if (specs.empty())
+            throw Error("at least one --line is required, e.g. --line \"desc=Consulting;qty=2;rate=100;account=Service Revenue\"");
 
         Book& b = c.modify();
         const Contact& ct = b.findContact(party, who);
@@ -489,21 +532,20 @@ void cmdDocument(Context& c, Args& a, DocKind kind) {
         d.contactId = ct.id;
         d.date = dateText ? dateArg(*dateText, "--date") : Date::today();
         const int terms = ct.termsDays >= 0 ? ct.termsDays : b.company.defaultTermsDays;
-        d.dueDate = dueText ? dateArg(*dueText, "--due") : d.date.addDays(terms);
+        d.dueDate = dueText ? dateArg(*dueText, kind == DocKind::Estimate ? "--expires" : "--due")
+                            : d.date.addDays(kind == DocKind::Estimate ? 30 : terms);
         if (number) d.number = *number;
         if (memo) d.memo = *memo;
-        if (tax) {
-            std::string rate = trim(*tax);
-            if (!rate.empty() && rate.back() == '%') rate.pop_back();
-            const auto r = Decimal::parse(rate);
-            if (!r) throw Error("invalid --tax '" + *tax + "' (a percentage such as 8.25)");
-            d.taxRate = *r;
-        }
+        if (tax) d.taxRate = taxArg(*tax);
+        if (deposit) d.depositAccountId = b.findAccount(*deposit).id;
         for (const auto& spec : specs) d.lines.push_back(parseLineSpec(b, kind, spec));
         const int id = b.createDocument(d);
         const Document& doc = b.document(id);
-        c.out << "Created " << noun << " " << doc.number << " for " << ct.name << ": total "
-              << doc.total().formatted() << ", due " << doc.dueDate << ".\n";
+        c.out << "Created " << noun << " " << doc.number << " for " << ct.name << ": total " << doc.total().formatted();
+        if (kind == DocKind::Estimate) c.out << ", expires " << doc.dueDate;
+        else if (docHasDueDate(kind)) c.out << ", due " << doc.dueDate;
+        c.out << ".\n";
+        for (const auto& spec : applies) applyCreditSpec(b, id, spec, c.out);
     } else if (sub == "list") {
         const bool open = a.flag("open");
         const bool csv = a.flag("csv");
@@ -523,25 +565,164 @@ void cmdDocument(Context& c, Args& a, DocKind kind) {
         const bool force = a.flag("force");
         a.finish();
         const Book& b = c.books();
-        const int id = b.findDocument(kind, ref).id;
-        const std::filesystem::path target = std::filesystem::u8path(outPath ? *outPath : documentPdfFileName(b, id));
-        if (std::filesystem::exists(target) && !force)
-            throw Error("'" + target.u8string() + "' already exists; use --force to overwrite it");
-        const std::string bytes = documentPdf(b, id);
-        std::ofstream out(target, std::ios::binary | std::ios::trunc);
-        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        out.close();
-        if (!out) throw Error("could not write '" + target.u8string() + "'");
-        c.out << "Wrote " << target.u8string() << " (" << bytes.size() / 1024 + 1 << " KB).\n";
+        writePdfFile(c, b, b.findDocument(kind, ref).id, outPath, force);
     } else if (sub == "void") {
         const std::string ref = a.positional(1, noun + " number");
         a.finish();
         Book& b = c.modify();
-        const Document& d = b.findDocument(kind, ref);
-        b.voidDocument(d.id);
-        c.out << "Voided " << noun << " " << d.number << ".\n";
+        const int id = b.findDocument(kind, ref).id;
+        b.voidDocument(id);
+        c.out << "Voided " << noun << " " << b.document(id).number << ".\n";
+    } else if (kind == DocKind::Estimate && (sub == "accept" || sub == "decline" || sub == "reopen")) {
+        const std::string ref = a.positional(1, "estimate number");
+        a.finish();
+        Book& b = c.modify();
+        const int id = b.findDocument(kind, ref).id;
+        const EstimateStatus status = sub == "accept"    ? EstimateStatus::Accepted
+                                      : sub == "decline" ? EstimateStatus::Declined
+                                                         : EstimateStatus::Pending;
+        b.setEstimateStatus(id, status);
+        c.out << "Estimate " << b.document(id).number << " is now " << toLower(toString(status)) << ".\n";
+    } else if (kind == DocKind::Estimate && sub == "convert") {
+        const std::string ref = a.positional(1, "estimate number");
+        const Date date = dateOr(a, "date", Date::today());
+        a.finish();
+        Book& b = c.modify();
+        const int id = b.findDocument(kind, ref).id;
+        const int invoiceId = b.convertEstimate(id, date);
+        const Document& inv = b.document(invoiceId);
+        c.out << "Converted estimate " << b.document(id).number << " to invoice " << inv.number << " ("
+              << inv.total().formatted() << ", due " << inv.dueDate << ").\n";
+    } else if (kind == DocKind::CreditMemo && sub == "apply") {
+        const std::string ref = a.positional(1, "credit memo number");
+        const std::string invoice = a.require("invoice");
+        const auto amount = a.get("amount");
+        a.finish();
+        Book& b = c.modify();
+        const int id = b.findDocument(kind, ref).id;
+        c.out << "Credit memo " << b.document(id).number << ":\n";
+        applyCreditSpec(b, id, amount ? invoice + "=" + *amount : invoice, c.out);
+        c.out << "  credit left: " << b.documentBalance(id).formatted() << '\n';
+    } else if (kind == DocKind::CreditMemo && sub == "unapply") {
+        const std::string ref = a.positional(1, "credit memo number");
+        const std::string invoice = a.require("invoice");
+        a.finish();
+        Book& b = c.modify();
+        const int id = b.findDocument(kind, ref).id;
+        const int invoiceId = b.findDocument(DocKind::Invoice, invoice).id;
+        b.unapplyCredit(id, invoiceId);
+        c.out << "Removed credit memo " << b.document(id).number << " from invoice " << b.document(invoiceId).number
+              << ".\n";
     } else {
-        throw Error("unknown " + noun + " subcommand '" + sub + "'");
+        throw Error("unknown " + noun + " subcommand '" + sub + "'; run 'openbooks help " +
+                    (kind == DocKind::CreditMemo ? std::string("credit-memo")
+                     : kind == DocKind::SalesReceipt ? std::string("sales-receipt")
+                                                     : toLower(toString(kind))) +
+                    "'");
+    }
+}
+
+void readRecurringOptions(Args& a, Book& b, RecurringInvoice& r, bool creating) {
+    if (auto v = a.get("customer")) r.contactId = b.findContact(ContactKind::Customer, *v).id;
+    if (auto v = a.get("frequency")) {
+        const auto f = parseFrequency(*v);
+        if (!f) throw Error("--frequency must be weekly, monthly or yearly");
+        r.frequency = *f;
+    }
+    if (auto v = a.get("every")) r.interval = intArg(*v, "--every", 1, 120);
+    if (auto v = a.get("start")) r.startDate = dateArg(*v, "--start");
+    if (auto v = a.get("end")) {
+        if (iequals(trim(*v), "none")) r.endDate.reset();
+        else r.endDate = dateArg(*v, "--end");
+    }
+    if (auto v = a.get("tax")) r.taxRate = taxArg(*v);
+    if (auto v = a.get("memo")) r.memo = *v;
+    const auto specs = a.getAll("line");
+    if (!specs.empty()) {
+        r.lines.clear();
+        for (const auto& spec : specs) r.lines.push_back(parseLineSpec(b, DocKind::Invoice, spec));
+    } else if (creating) {
+        throw Error("at least one --line is required");
+    }
+}
+
+void cmdRecurring(Context& c, Args& a) {
+    const std::string sub = a.positional(0, "subcommand (add, edit, list, show, run, pause, resume, delete)");
+    if (sub == "list") {
+        const bool csv = a.flag("csv");
+        a.finish();
+        print(c, recurringList(c.books(), Date::today()), csv);
+    } else if (sub == "add") {
+        const std::string name = a.positional(1, "name");
+        a.require("customer");  // mark required before the book is loaded
+        Book& b = c.modify();
+        RecurringInvoice r;
+        r.name = name;
+        r.startDate = Date::today();
+        readRecurringOptions(a, b, r, true);
+        a.finish();
+        const int id = b.addRecurring(r);
+        const RecurringInvoice& saved = b.recurringInvoice(id);
+        c.out << "Added recurring invoice '" << saved.name << "': " << saved.total().formatted() << ", "
+              << toLower(saved.scheduleText()) << ", first on " << saved.nextDate() << ".\n";
+    } else if (sub == "edit") {
+        const std::string ref = a.positional(1, "recurring invoice");
+        const auto newName = a.get("name");
+        Book& b = c.modify();
+        RecurringInvoice r = b.findRecurring(ref);
+        if (newName) r.name = *newName;
+        readRecurringOptions(a, b, r, false);
+        a.finish();
+        b.updateRecurring(r);
+        c.out << "Updated recurring invoice '" << trim(r.name) << "'.\n";
+    } else if (sub == "show") {
+        const std::string ref = a.positional(1, "recurring invoice");
+        a.finish();
+        const Book& b = c.books();
+        const RecurringInvoice& r = b.findRecurring(ref);
+        c.out << r.name << (r.active ? "" : "  (paused)") << '\n'
+              << "Customer:  " << b.contact(r.contactId).name << '\n'
+              << "Schedule:  " << r.scheduleText() << " from " << r.startDate
+              << (r.endDate ? " until " + r.endDate->str() : std::string()) << '\n'
+              << "Next:      " << (r.finished() ? std::string("(finished)") : r.nextDate().str()) << '\n'
+              << "Created:   " << r.occurrencesCreated << " invoice(s)\n"
+              << "Amount:    " << r.total().formatted() << '\n';
+        for (const auto& l : r.lines)
+            c.out << "  - " << l.description << "  " << l.quantity.str() << " x " << l.rate.formatted() << " = "
+                  << l.amount.formatted() << '\n';
+    } else if (sub == "pause" || sub == "resume") {
+        const std::string ref = a.positional(1, "recurring invoice");
+        a.finish();
+        Book& b = c.modify();
+        RecurringInvoice r = b.findRecurring(ref);
+        r.active = sub == "resume";
+        b.updateRecurring(r);
+        c.out << (r.active ? "Resumed" : "Paused") << " '" << r.name << "'.\n";
+    } else if (sub == "delete") {
+        const std::string ref = a.positional(1, "recurring invoice");
+        a.finish();
+        Book& b = c.modify();
+        const RecurringInvoice& r = b.findRecurring(ref);
+        const std::string name = r.name;
+        b.deleteRecurring(r.id);
+        c.out << "Deleted recurring invoice '" << name << "' (invoices already created are kept).\n";
+    } else if (sub == "run") {
+        const Date through = dateOr(a, "through", Date::today());
+        a.finish();
+        Book& b = c.modify();
+        const std::vector<int> created = b.createDueRecurringInvoices(through);
+        if (created.empty()) {
+            c.out << "No recurring invoices are due through " << through << ".\n";
+            return;
+        }
+        for (int id : created) {
+            const Document& d = b.document(id);
+            c.out << "Created invoice " << d.number << " for " << b.contact(d.contactId).name << " dated " << d.date
+                  << ": " << d.total().formatted() << '\n';
+        }
+        c.out << created.size() << " invoice(s) created.\n";
+    } else {
+        throw Error("unknown recurring subcommand '" + sub + "'");
     }
 }
 
@@ -852,7 +1033,8 @@ void printHelp(std::ostream& out) {
         << "The books file defaults to $OPENBOOKS_FILE, then ./books.obk\n\n"
         << "Commands:\n";
     for (const auto& cmd : commands()) out << "  " << cmd.name << std::string(18 - std::min<std::size_t>(17, cmd.name.size()), ' ') << cmd.summary << '\n';
-    out << "\nShortcuts: accounts, customers, vendors, items, invoices, bills, payments, transactions\n"
+    out << "\nShortcuts: accounts, customers, vendors, items, invoices, estimates, credit-memos,\n"
+        << "           sales-receipts, bills, payments, transactions\n"
         << "Run 'openbooks help COMMAND' for details.\n\n"
         << "References: accounts, customers, vendors and items may be given by name, a unique\n"
         << "name prefix, account number, or #id. Dates: YYYY-MM-DD, MM/DD/YYYY or 'today'.\n\n"
@@ -923,6 +1105,38 @@ const std::vector<Command>& commands() {
          "  openbooks invoice pdf NUMBER [--out FILE] [--force]\n"
          "  openbooks invoice void NUMBER",
          "Create, list, print and void invoices", [](Context& c, Args& a) { cmdDocument(c, a, DocKind::Invoice); }},
+        {"estimate",
+         "  openbooks estimate create --customer C --line SPEC [--line SPEC ...] [--date D] [--expires D]\n"
+         "                            [--number N] [--tax PERCENT] [--memo TEXT]\n"
+         "  openbooks estimate list [--open] [--customer C] [--csv]\n"
+         "  openbooks estimate show|pdf|void NUMBER\n"
+         "  openbooks estimate accept|decline|reopen NUMBER\n"
+         "  openbooks estimate convert NUMBER [--date D]      (creates an invoice)\n"
+         "  Estimates never touch the ledger until converted.",
+         "Quotes that can be converted into invoices", [](Context& c, Args& a) { cmdDocument(c, a, DocKind::Estimate); }},
+        {"credit-memo",
+         "  openbooks credit-memo create --customer C --line SPEC [--line SPEC ...] [--date D] [--number N]\n"
+         "                               [--tax PERCENT] [--memo TEXT] [--apply INVOICE[=AMOUNT] ...]\n"
+         "  openbooks credit-memo apply NUMBER --invoice INVOICE [--amount X]\n"
+         "  openbooks credit-memo unapply NUMBER --invoice INVOICE\n"
+         "  openbooks credit-memo list|show|pdf|void ...\n"
+         "  A credit memo reduces what the customer owes; apply it to their invoices.",
+         "Customer credits (returns, discounts, corrections)",
+         [](Context& c, Args& a) { cmdDocument(c, a, DocKind::CreditMemo); }},
+        {"sales-receipt",
+         "  openbooks sales-receipt create --customer C --deposit-to ACCOUNT --line SPEC [--line SPEC ...]\n"
+         "                                 [--date D] [--number N] [--tax PERCENT] [--memo TEXT]\n"
+         "  openbooks sales-receipt list|show|pdf|void ...\n"
+         "  For sales paid on the spot: no invoice, the money goes straight into ACCOUNT.",
+         "Record a sale paid immediately", [](Context& c, Args& a) { cmdDocument(c, a, DocKind::SalesReceipt); }},
+        {"recurring",
+         "  openbooks recurring add NAME --customer C --line SPEC [--line SPEC ...] [--frequency weekly|monthly|yearly]\n"
+         "                          [--every N] [--start D] [--end D] [--tax PERCENT] [--memo TEXT]\n"
+         "  openbooks recurring edit NAME [--name N] [same options as add; --line replaces all lines; --end none]\n"
+         "  openbooks recurring list [--csv] | show NAME | pause NAME | resume NAME | delete NAME\n"
+         "  openbooks recurring run [--through D]     (creates every invoice that is due)\n"
+         "  Invoices are only created when you run 'recurring run' (or click Create in the app).",
+         "Invoice templates that repeat on a schedule", cmdRecurring},
         {"bill",
          "  openbooks bill create --vendor V --line SPEC [--line SPEC ...] [--date D] [--due D] [--number N] [--memo TEXT]\n"
          "  openbooks bill list [--open] [--vendor V] [--csv]\n"
@@ -1004,6 +1218,7 @@ const std::vector<Command>& commands() {
 const std::map<std::string, std::string> kShortcuts = {
     {"accounts", "account"}, {"customers", "customer"}, {"vendors", "vendor"},  {"items", "item"},
     {"invoices", "invoice"}, {"bills", "bill"},         {"payments", "payment"}, {"transactions", "txn"},
+    {"estimates", "estimate"}, {"credit-memos", "credit-memo"}, {"sales-receipts", "sales-receipt"},
 };
 
 void dispatch(Context& c, std::vector<std::string> tokens) {

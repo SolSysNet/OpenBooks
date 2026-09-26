@@ -231,14 +231,13 @@ void App::transactionContextMenu(int txnId, int accountId) {
     }
     const bool manual = isManualKind(t.kind);
     if (!manual) {
+        int openId = 0;
         for (const auto& doc : b.documents()) {
             if (doc.txnId != txnId) continue;
-            const bool invoice = doc.kind == DocKind::Invoice;
-            if (ImGui::MenuItem(invoice ? "Open invoice" : "Open bill")) {
-                (invoice ? invoices_ : bills_).selectedId = doc.id;
-                go(invoice ? Screen::Invoices : Screen::Bills);
-            }
+            const std::string label = std::string("Open ") + docNoun(doc.kind);
+            if (ImGui::MenuItem(label.c_str())) openId = doc.id;
         }
+        if (openId) openDocument(openId);
     }
     if (ImGui::MenuItem("Change account...", nullptr, false, manual)) {
         recategorize_ = RecategorizeState{};

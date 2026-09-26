@@ -45,7 +45,6 @@ const T& resolveByName(const std::vector<T>& items, std::string_view ref, Pred i
     throw Error("no " + noun + " matches '" + wanted + "'");
 }
 
-const char* docNoun(DocKind k) { return k == DocKind::Invoice ? "invoice" : "bill"; }
 
 }  // namespace
 
@@ -414,7 +413,38 @@ void Book::recategorize(int txnId, int fromAccountId, int toAccountId) {
     }
 }
 
-// --------------------------------------------------------- invoices & bills
+// ------------------------------------------------------------ documents
+
+namespace {
+
+// Auto-number prefix and counter for each kind (bills use the vendor's own numbers).
+const char* numberPrefix(DocKind k) {
+    switch (k) {
+        case DocKind::Estimate: return "EST-";
+        case DocKind::CreditMemo: return "CM-";
+        case DocKind::SalesReceipt: return "SR-";
+        default: return "";
+    }
+}
+
+int* numberCounter(Company& c, DocKind k) {
+    switch (k) {
+        case DocKind::Invoice: return &c.nextInvoiceNumber;
+        case DocKind::Estimate: return &c.nextEstimateNumber;
+        case DocKind::CreditMemo: return &c.nextCreditMemoNumber;
+        case DocKind::SalesReceipt: return &c.nextSalesReceiptNumber;
+        default: return nullptr;
+    }
+}
+
+// "CM-12" -> 12 for the CM- prefix; nullopt if the number doesn't follow the pattern.
+std::optional<long long> numericPart(DocKind k, const std::string& number) {
+    const std::string prefix = numberPrefix(k);
+    if (number.size() <= prefix.size() || number.compare(0, prefix.size(), prefix) != 0) return std::nullopt;
+    return parseInt(std::string_view(number).substr(prefix.size()));
+}
+
+}  // namespace
 
 bool Book::documentNumberTaken(DocKind kind, const std::string& number) const {
     for (const auto& d : documents_) {
@@ -424,23 +454,39 @@ bool Book::documentNumberTaken(DocKind kind, const std::string& number) const {
 }
 
 int Book::createDocument(Document d) {
-    const bool invoice = d.kind == DocKind::Invoice;
+    const DocKind kind = d.kind;
+    const std::string noun = docNoun(kind);
     const Contact& c = contact(d.contactId);
-    const ContactKind wanted = invoice ? ContactKind::Customer : ContactKind::Vendor;
-    if (c.kind != wanted)
-        throw Error(std::string(invoice ? "invoices" : "bills") + " must be for a " + toLower(toString(wanted)));
+    const ContactKind wanted = partyKind(kind);
+    if (c.kind != wanted) throw Error(noun + "s must be for a " + toLower(toString(wanted)));
     if (!c.active) throw Error("'" + c.name + "' is inactive");
 
-    const int controlId = invoice ? company.receivablesAccountId : company.payablesAccountId;
-    if (controlId == 0)
-        throw Error(std::string("no ") + (invoice ? "Accounts Receivable" : "Accounts Payable") +
-                    " account is configured");
+    int controlId = 0;
+    if (kind == DocKind::Invoice || kind == DocKind::CreditMemo) {
+        controlId = company.receivablesAccountId;
+        if (controlId == 0) throw Error("no Accounts Receivable account is configured");
+    } else if (kind == DocKind::Bill) {
+        controlId = company.payablesAccountId;
+        if (controlId == 0) throw Error("no Accounts Payable account is configured");
+    }
+    if (kind == DocKind::SalesReceipt) {
+        const Account& deposit = account(d.depositAccountId);
+        if (isSubledgerAccount(deposit.id)) throw Error("choose a bank or cash account to deposit the sale into");
+        if (!deposit.active) throw Error("'" + deposit.name + "' is inactive");
+    } else {
+        d.depositAccountId = 0;
+    }
+
     if (d.lines.empty()) throw Error("at least one line is required");
-    if (d.dueDate < d.date) throw Error("the due date is before the document date");
+    if (!docHasDueDate(kind)) d.dueDate = d.date;
+    if (d.dueDate < d.date)
+        throw Error(kind == DocKind::Estimate ? "the expiry date is before the estimate date"
+                                              : "the due date is before the document date");
     if (d.taxRate < Decimal()) throw Error("tax rate cannot be negative");
-    if (!invoice && !d.taxRate.isZero()) throw Error("bills do not take a tax rate; include tax in the line amounts");
-    if (!d.taxRate.isZero() && company.salesTaxAccountId == 0)
-        throw Error("no Sales Tax Payable account is configured");
+    if (kind == DocKind::Bill && !d.taxRate.isZero())
+        throw Error("bills do not take a tax rate; include tax in the line amounts");
+    if (!d.taxRate.isZero() && company.salesTaxAccountId == 0) throw Error("no Sales Tax Payable account is configured");
+    if (d.recurringId != 0 && kind != DocKind::Invoice) throw Error("only invoices can come from a recurring template");
 
     for (auto& l : d.lines) {
         if (l.itemId != 0) item(l.itemId);  // must exist
@@ -448,49 +494,71 @@ int Book::createDocument(Document d) {
         if (isSubledgerAccount(a.id)) throw Error("lines cannot post to A/R or A/P");
         l.amount = multiply(l.rate, l.quantity);
     }
-    if (d.total() <= Money()) throw Error(std::string(docNoun(d.kind)) + " total must be greater than zero");
+    if (d.total() <= Money()) throw Error(noun + " total must be greater than zero");
+
+    // Links and applications are only ever set by convertEstimate() / applyCredit().
+    d.applications.clear();
+    d.linkedDocId = 0;
+    d.estimateStatus = EstimateStatus::Pending;
 
     // Work out the number without touching state until everything has validated.
     d.number = trim(d.number);
+    int* counter = numberCounter(company, kind);
+    int nextNumber = counter ? *counter : 0;
     bool autoNumbered = false;
-    int nextInvoice = company.nextInvoiceNumber;
     if (d.number.empty()) {
         autoNumbered = true;
-        if (invoice) {
-            while (documentNumberTaken(DocKind::Invoice, std::to_string(nextInvoice))) ++nextInvoice;
-            d.number = std::to_string(nextInvoice);
+        if (counter) {
+            while (documentNumberTaken(kind, numberPrefix(kind) + std::to_string(nextNumber))) ++nextNumber;
+            d.number = numberPrefix(kind) + std::to_string(nextNumber);
         } else {
             d.number = "B" + std::to_string(nextDocId_);
         }
-    } else if (invoice && documentNumberTaken(DocKind::Invoice, d.number)) {
-        throw Error("invoice number " + d.number + " is already used");
+    } else if (counter && documentNumberTaken(kind, d.number)) {
+        throw Error(noun + " number " + d.number + " is already used");
     }
 
-    Transaction t;
-    t.date = d.date;
-    t.kind = invoice ? TxnKind::Invoice : TxnKind::Bill;
-    t.ref = d.number;
-    t.payee = c.name;
-    t.memo = d.memo;
-    const Money total = d.total();
-    if (invoice) {
-        t.splits.push_back(Split{controlId, total, "", SplitState::Uncleared});
-        for (const auto& l : d.lines) t.splits.push_back(Split{l.accountId, -l.amount, l.description, SplitState::Uncleared});
+    if (docPosts(kind)) {
+        Transaction t;
+        t.date = d.date;
+        t.ref = d.number;
+        t.payee = c.name;
+        t.memo = d.memo;
+        const Money total = d.total();
         const Money tax = d.tax();
-        if (!tax.isZero()) t.splits.push_back(Split{company.salesTaxAccountId, -tax, "Sales tax", SplitState::Uncleared});
+        switch (kind) {
+            case DocKind::Invoice: t.kind = TxnKind::Invoice; break;
+            case DocKind::CreditMemo: t.kind = TxnKind::CreditMemo; break;
+            case DocKind::SalesReceipt: t.kind = TxnKind::SalesReceipt; break;
+            default: t.kind = TxnKind::Bill; break;
+        }
+        if (kind == DocKind::Bill) {
+            for (const auto& l : d.lines)
+                t.splits.push_back(Split{l.accountId, l.amount, l.description, SplitState::Uncleared});
+            t.splits.push_back(Split{controlId, -total, "", SplitState::Uncleared});
+        } else {
+            // Invoices and sales receipts debit the money side and credit income and tax;
+            // a credit memo is the exact mirror image.
+            const bool mirror = kind == DocKind::CreditMemo;
+            const int moneySide = kind == DocKind::SalesReceipt ? d.depositAccountId : controlId;
+            t.splits.push_back(Split{moneySide, mirror ? -total : total, "", SplitState::Uncleared});
+            for (const auto& l : d.lines)
+                t.splits.push_back(Split{l.accountId, mirror ? l.amount : -l.amount, l.description, SplitState::Uncleared});
+            if (!tax.isZero())
+                t.splits.push_back(Split{company.salesTaxAccountId, mirror ? tax : -tax, "Sales tax", SplitState::Uncleared});
+        }
+        d.txnId = insertTransaction(std::move(t));  // last step that can throw
     } else {
-        for (const auto& l : d.lines) t.splits.push_back(Split{l.accountId, l.amount, l.description, SplitState::Uncleared});
-        t.splits.push_back(Split{controlId, -total, "", SplitState::Uncleared});
+        d.txnId = 0;
     }
 
-    d.txnId = insertTransaction(std::move(t));  // last step that can throw
     d.id = nextDocId_++;
     d.voided = false;
-    if (invoice) {
+    if (counter) {
         if (autoNumbered) {
-            company.nextInvoiceNumber = nextInvoice + 1;
-        } else if (auto n = parseInt(d.number); n && *n >= company.nextInvoiceNumber && *n < INT_MAX) {
-            company.nextInvoiceNumber = static_cast<int>(*n) + 1;
+            *counter = nextNumber + 1;
+        } else if (auto n = numericPart(kind, d.number); n && *n >= *counter && *n < INT_MAX) {
+            *counter = static_cast<int>(*n) + 1;
         }
     }
     documents_.push_back(std::move(d));
@@ -499,19 +567,219 @@ int Book::createDocument(Document d) {
 
 void Book::voidDocument(int documentId) {
     Document& d = docMut(documentId);
-    if (d.voided) throw Error(std::string(docNoun(d.kind)) + " " + d.number + " is already void");
+    const std::string label = std::string(docNoun(d.kind)) + " " + d.number;
+    if (d.voided) throw Error(label + " is already void");
     for (const auto& p : payments_) {
         if (p.voided) continue;
         for (const auto& a : p.applications) {
             if (a.documentId == documentId)
-                throw Error("payment #" + std::to_string(p.id) + " is applied to " + docNoun(d.kind) + " " +
-                            d.number + "; void the payment first");
+                throw Error("payment #" + std::to_string(p.id) + " is applied to " + label + "; void the payment first");
         }
     }
-    voidTransactionInternal(txnMut(d.txnId));
+    for (const auto& cm : documents_) {
+        if (cm.kind != DocKind::CreditMemo || cm.voided) continue;
+        for (const auto& a : cm.applications) {
+            if (a.documentId == documentId)
+                throw Error("credit memo " + cm.number + " is applied to " + label + "; unapply it first");
+        }
+    }
+    if (d.txnId != 0) voidTransactionInternal(txnMut(d.txnId));
     d.voided = true;
+    d.applications.clear();  // a voided credit memo releases its applications, so those invoices reopen
 }
 
+// ---------------------------------------------------------------- estimates
+
+EstimateStatus Book::estimateStatus(int estimateId) const {
+    const Document& e = document(estimateId);
+    if (e.linkedDocId != 0 && !document(e.linkedDocId).voided) return EstimateStatus::Converted;
+    return e.estimateStatus == EstimateStatus::Converted ? EstimateStatus::Accepted : e.estimateStatus;
+}
+
+void Book::setEstimateStatus(int estimateId, EstimateStatus status) {
+    const Document& e = document(estimateId);
+    if (e.kind != DocKind::Estimate) throw Error(e.number + " is not an estimate");
+    if (e.voided) throw Error("estimate " + e.number + " is void");
+    if (status == EstimateStatus::Converted) throw Error("convert the estimate to an invoice instead");
+    if (estimateStatus(estimateId) == EstimateStatus::Converted)
+        throw Error("estimate " + e.number + " has already been converted to invoice " +
+                    document(e.linkedDocId).number);
+    docMut(estimateId).estimateStatus = status;
+}
+
+int Book::convertEstimate(int estimateId, Date invoiceDate) {
+    const Document& e = document(estimateId);
+    if (e.kind != DocKind::Estimate) throw Error(e.number + " is not an estimate");
+    if (e.voided) throw Error("estimate " + e.number + " is void");
+    if (estimateStatus(estimateId) == EstimateStatus::Converted)
+        throw Error("estimate " + e.number + " was already converted to invoice " + document(e.linkedDocId).number);
+    const Contact& c = contact(e.contactId);
+    const int terms = c.termsDays >= 0 ? c.termsDays : company.defaultTermsDays;
+
+    Document inv;
+    inv.kind = DocKind::Invoice;
+    inv.contactId = e.contactId;
+    inv.date = invoiceDate;
+    inv.dueDate = invoiceDate.addDays(terms);
+    inv.lines = e.lines;
+    inv.taxRate = e.taxRate;
+    inv.memo = e.memo;
+    const int invoiceId = createDocument(std::move(inv));  // `e` may dangle after this
+
+    Document& estimate = docMut(estimateId);
+    estimate.linkedDocId = invoiceId;
+    estimate.estimateStatus = EstimateStatus::Converted;
+    docMut(invoiceId).linkedDocId = estimateId;
+    return invoiceId;
+}
+
+// ------------------------------------------------------------- credit memos
+
+void Book::applyCredit(int creditMemoId, int invoiceId, Money amount) {
+    const Document& cm = document(creditMemoId);
+    const Document& inv = document(invoiceId);
+    if (cm.kind != DocKind::CreditMemo) throw Error(cm.number + " is not a credit memo");
+    if (inv.kind != DocKind::Invoice) throw Error("credits can only be applied to invoices");
+    if (cm.voided) throw Error("credit memo " + cm.number + " is void");
+    if (inv.voided) throw Error("invoice " + inv.number + " is void");
+    if (cm.contactId != inv.contactId)
+        throw Error("credit memo " + cm.number + " and invoice " + inv.number + " are for different customers");
+    if (amount <= Money()) throw Error("the amount to apply must be greater than zero");
+    const Money owed = documentBalance(invoiceId);
+    const Money available = documentBalance(creditMemoId);
+    if (amount > owed) throw Error("invoice " + inv.number + " only has " + owed.formatted() + " left to pay");
+    if (amount > available)
+        throw Error("credit memo " + cm.number + " only has " + available.formatted() + " of credit left");
+    Document& memo = docMut(creditMemoId);
+    for (auto& a : memo.applications) {
+        if (a.documentId == invoiceId) {
+            a.amount += amount;
+            return;
+        }
+    }
+    memo.applications.push_back(Application{invoiceId, amount});
+}
+
+void Book::unapplyCredit(int creditMemoId, int invoiceId) {
+    Document& cm = docMut(creditMemoId);
+    if (cm.kind != DocKind::CreditMemo) throw Error(cm.number + " is not a credit memo");
+    const auto before = cm.applications.size();
+    cm.applications.erase(std::remove_if(cm.applications.begin(), cm.applications.end(),
+                                         [invoiceId](const Application& a) { return a.documentId == invoiceId; }),
+                          cm.applications.end());
+    if (cm.applications.size() == before)
+        throw Error("credit memo " + cm.number + " is not applied to invoice " + document(invoiceId).number);
+}
+
+// ---------------------------------------------------------------- recurring
+
+const RecurringInvoice& Book::recurringInvoice(int id) const {
+    if (auto* r = findById(recurring_, id)) return *r;
+    throw Error("no recurring invoice with id " + std::to_string(id));
+}
+
+RecurringInvoice& Book::recurringMut(int id) { return const_cast<RecurringInvoice&>(recurringInvoice(id)); }
+
+const RecurringInvoice& Book::findRecurring(std::string_view ref) const {
+    if (auto id = parseIdRef(ref)) return recurringInvoice(*id);
+    return resolveByName(recurring_, ref, [](const RecurringInvoice&) { return true; }, "recurring invoice");
+}
+
+void Book::validateRecurring(const RecurringInvoice& r) const {
+    if (trim(r.name).empty()) throw Error("give the recurring invoice a name");
+    if (r.name[0] == '#') throw Error("names may not start with '#'");
+    for (const auto& other : recurring_) {
+        if (other.id != r.id && iequals(other.name, trim(r.name)))
+            throw Error("a recurring invoice named '" + trim(r.name) + "' already exists");
+    }
+    const Contact& c = contact(r.contactId);
+    if (c.kind != ContactKind::Customer) throw Error("recurring invoices must be for a customer");
+    if (r.lines.empty()) throw Error("at least one line is required");
+    for (const auto& l : r.lines) {
+        if (l.itemId != 0) item(l.itemId);
+        if (isSubledgerAccount(account(l.accountId).id)) throw Error("lines cannot post to A/R or A/P");
+    }
+    if (r.interval < 1 || r.interval > 120) throw Error("the repeat interval must be between 1 and 120");
+    if (r.taxRate < Decimal()) throw Error("tax rate cannot be negative");
+    if (!r.taxRate.isZero() && company.salesTaxAccountId == 0) throw Error("no Sales Tax Payable account is configured");
+    if (r.endDate && *r.endDate < r.startDate) throw Error("the end date is before the start date");
+    if (r.total() <= Money()) throw Error("recurring invoice total must be greater than zero");
+}
+
+int Book::addRecurring(RecurringInvoice r) {
+    for (auto& l : r.lines) l.amount = multiply(l.rate, l.quantity);
+    r.id = 0;
+    r.name = trim(r.name);
+    r.occurrencesCreated = 0;
+    validateRecurring(r);
+    r.id = nextRecurringId_++;
+    recurring_.push_back(std::move(r));
+    return recurring_.back().id;
+}
+
+void Book::updateRecurring(const RecurringInvoice& updated) {
+    RecurringInvoice& current = recurringMut(updated.id);
+    RecurringInvoice next = updated;
+    for (auto& l : next.lines) l.amount = multiply(l.rate, l.quantity);
+    next.name = trim(next.name);
+    next.occurrencesCreated = current.occurrencesCreated;
+    validateRecurring(next);
+    current = std::move(next);
+}
+
+void Book::deleteRecurring(int id) {
+    recurringInvoice(id);
+    recurring_.erase(std::remove_if(recurring_.begin(), recurring_.end(),
+                                    [id](const RecurringInvoice& r) { return r.id == id; }),
+                     recurring_.end());
+}
+
+int Book::dueRecurringCount(Date through) const {
+    int count = 0;
+    for (const auto& r : recurring_) {
+        if (!r.active) continue;
+        for (int k = r.occurrencesCreated; count < 10000; ++k) {
+            const Date next = r.occurrence(k);
+            if (next > through || (r.endDate && next > *r.endDate)) break;
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::vector<int> Book::createDueRecurringInvoices(Date through) {
+    constexpr std::size_t kLimit = 500;
+    Book draft = *this;  // all or nothing
+    std::vector<int> created;
+    for (auto& r : draft.recurring_) {
+        if (!r.active) continue;
+        while (true) {
+            const Date next = r.nextDate();
+            if (next > through || (r.endDate && next > *r.endDate)) break;
+            if (created.size() >= kLimit)
+                throw Error("more than " + std::to_string(kLimit) +
+                            " invoices would be created at once; check the start dates of your recurring invoices");
+            const Contact& c = draft.contact(r.contactId);
+            Document inv;
+            inv.kind = DocKind::Invoice;
+            inv.contactId = r.contactId;
+            inv.date = next;
+            inv.dueDate = next.addDays(c.termsDays >= 0 ? c.termsDays : draft.company.defaultTermsDays);
+            inv.lines = r.lines;
+            inv.taxRate = r.taxRate;
+            inv.memo = r.memo;
+            inv.recurringId = r.id;
+            try {
+                created.push_back(draft.createDocument(std::move(inv)));
+            } catch (const Error& e) {
+                throw Error("recurring invoice '" + r.name + "' (" + next.str() + "): " + e.what());
+            }
+            ++r.occurrencesCreated;
+        }
+    }
+    *this = std::move(draft);
+    return created;
+}
 // ---------------------------------------------------------------- payments
 
 int Book::recordPayment(Payment p) {
@@ -671,16 +939,34 @@ Money Book::documentPaid(int documentId, std::optional<Date> asOf) const {
     return paid;
 }
 
+Money Book::documentCredited(int documentId, std::optional<Date> asOf) const {
+    Money credited;
+    for (const auto& cm : documents_) {
+        if (cm.kind != DocKind::CreditMemo || cm.voided || (asOf && cm.date > *asOf)) continue;
+        for (const auto& a : cm.applications) {
+            if (a.documentId == documentId) credited += a.amount;
+        }
+    }
+    return credited;
+}
+
 Money Book::documentBalance(int documentId, std::optional<Date> asOf) const {
     const Document& d = document(documentId);
     if (d.voided) return Money();
-    return d.total() - documentPaid(documentId, asOf);
+    switch (d.kind) {
+        case DocKind::Invoice: return d.total() - documentPaid(documentId, asOf) - documentCredited(documentId, asOf);
+        case DocKind::Bill: return d.total() - documentPaid(documentId, asOf);
+        case DocKind::CreditMemo: return d.total() - d.applied();
+        default: return Money();  // estimates never post; sales receipts are paid on the spot
+    }
 }
 
 Money Book::contactBalance(int contactId) const {
     Money total;
     for (const auto& d : documents_) {
-        if (d.contactId == contactId && !d.voided) total += documentBalance(d.id);
+        if (d.contactId != contactId || d.voided) continue;
+        if (d.kind == DocKind::Invoice || d.kind == DocKind::Bill) total += documentBalance(d.id);
+        if (d.kind == DocKind::CreditMemo) total -= documentBalance(d.id);
     }
     for (const auto& p : payments_) {
         if (p.contactId == contactId && !p.voided) total -= p.unapplied();

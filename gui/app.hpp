@@ -38,6 +38,10 @@ enum class Screen {
     Reports,
     Company,
     DocumentEditor,
+    Estimates,
+    CreditMemos,
+    SalesReceipts,
+    Recurring,
 };
 
 // ------------------------------------------------------------ screen state
@@ -63,6 +67,16 @@ struct DocumentEditorState {
     std::vector<LineDraft> lines;
     std::string error;
     Screen returnTo = Screen::Invoices;
+    int depositAccountId = 0;  // sales receipts
+    // Recurring-template mode: the same editor builds a RecurringInvoice instead of a document.
+    bool templateMode = false;
+    int recurringId = 0;  // 0 = new template
+    std::string templateName;
+    int frequency = 1;  // 0 weekly, 1 monthly, 2 yearly
+    int interval = 1;
+    bool hasEndDate = false;
+    ob::Date endDate;
+    bool templateActive = true;
 };
 
 struct PaymentFormState {
@@ -74,6 +88,14 @@ struct PaymentFormState {
     std::string memo;
     std::map<int, bool> selected;          // document id -> checked
     std::map<int, std::string> applied;    // document id -> amount text
+    std::string error;
+};
+
+struct ApplyCreditState {
+    int contactId = 0;
+    int creditMemoId = 0;
+    int invoiceId = 0;
+    std::string amount;
     std::string error;
 };
 
@@ -252,16 +274,17 @@ public:
 
 private:
     // ---- books & persistence
-    bool openBooks(const std::string& path);
+    bool openBooks(std::string path);
     void closeBooks();
     bool commit(const std::function<void(ob::Book&)>& change, std::string* error = nullptr,
                 const std::string& success = {});
     const Derived& derived();
     void loadConfig();
     void saveConfig() const;
-    void rememberRecent(const std::string& path);
+    void rememberRecent(std::string path);
 
     // ---- chrome
+    void drawFrame();
     void drawMenuBar();
     void drawSidebar();
     void drawStatusBar();
@@ -281,6 +304,14 @@ private:
     void drawDocumentDetail(int documentId);
     void drawDocumentEditor();
     void startDocument(ob::DocKind kind, int contactId, Screen returnTo);
+    void startRecurringEditor(int recurringId);  // 0 = new
+    ListState& listFor(ob::DocKind kind);
+    Screen screenFor(ob::DocKind kind) const;
+    void openDocument(int documentId);  // navigate to its list and select it
+    void openApplyCredit(int contactId, int creditMemoId, int invoiceId);
+    void drawApplyCreditModal();
+    void drawRecurring();
+    void createDueRecurring();
     void drawPaymentForm(ob::PaymentKind kind);
     void startPayment(ob::PaymentKind kind, int contactId);
     void drawPayments();
@@ -330,6 +361,11 @@ private:
     ListState vendors_;
     ListState invoices_;
     ListState bills_;
+    ListState estimates_;
+    ListState creditMemos_;
+    ListState salesReceipts_;
+    ListState recurringList_;
+    ApplyCreditState applyCredit_;
     ListState payments_;
     ListState accountsList_;
     ListState itemsList_;

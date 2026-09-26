@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(OpenBooks VERSION 0.3.0 LANGUAGES CXX)
+project(OpenBooks VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -80,6 +80,7 @@ if(OPENBOOKS_BUILD_GUI)
     set(OPENBOOKS_GUI_SOURCES
         gui/app.cpp
         gui/app_sales.cpp
+        gui/app_documents.cpp
         gui/app_banking.cpp
         gui/app_setup.cpp
         gui/app_reports.cpp

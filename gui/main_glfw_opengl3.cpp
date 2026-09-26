@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_Init(glslVersion);
     obgui::loadFonts();
 
-    {
+    try {
         obgui::App app(argc > 1 ? argv[1] : "");
         std::string title;
         int busyFrames = 3;
@@ -92,6 +92,8 @@ int main(int argc, char** argv) {
             }
             if (app.quitRequested()) glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "OpenBooks hit an unexpected error and has to close: %s\n", e.what());
     }
 
     ImGui_ImplOpenGL3_Shutdown();

@@ -28,6 +28,8 @@ public:
         d.days_ = days_ + n;
         return d;
     }
+    // Same day n months later, clamped to the end of shorter months (Jan 31 + 1 = Feb 28/29).
+    Date addMonths(int n) const;
     std::string str() const;  // "YYYY-MM-DD"
 
     friend constexpr bool operator==(Date a, Date b) { return a.days_ == b.days_; }

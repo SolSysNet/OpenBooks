@@ -3,6 +3,7 @@
 #include "openbooks/util.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <map>
 #include <set>
@@ -250,32 +251,81 @@ Table itemList(const Book& b, bool includeInactive) {
     return t;
 }
 
+std::string documentStatus(const Book& b, const Document& d, Date today) {
+    if (d.voided) return "Void";
+    const Money balance = b.documentBalance(d.id);
+    switch (d.kind) {
+        case DocKind::Estimate: {
+            const EstimateStatus s = b.estimateStatus(d.id);
+            if (s == EstimateStatus::Pending && d.dueDate < today) return "Expired";
+            return toString(s);
+        }
+        case DocKind::SalesReceipt: return "Paid";
+        case DocKind::CreditMemo:
+            if (balance.isZero()) return "Applied";
+            return balance < d.total() ? "Partly applied" : "Unapplied";
+        default:
+            if (balance.isZero()) return "Paid";
+            if (d.dueDate < today) return "Overdue";
+            return balance < d.total() ? "Partial" : "Open";
+    }
+}
+
+bool documentIsOpen(const Book& b, const Document& d) {
+    if (d.voided) return false;
+    if (d.kind == DocKind::Estimate) {
+        const EstimateStatus s = b.estimateStatus(d.id);
+        return s == EstimateStatus::Pending || s == EstimateStatus::Accepted;
+    }
+    return !b.documentBalance(d.id).isZero();
+}
+
+const char* documentListTitle(DocKind kind) {
+    switch (kind) {
+        case DocKind::Invoice: return "Invoices";
+        case DocKind::Bill: return "Bills";
+        case DocKind::Estimate: return "Estimates";
+        case DocKind::CreditMemo: return "Credit Memos";
+        case DocKind::SalesReceipt: return "Sales Receipts";
+    }
+    return "Documents";
+}
+
 Table documentList(const Book& b, DocKind kind, bool openOnly, int contactId, Date today) {
-    const bool invoice = kind == DocKind::Invoice;
     Table t;
-    t.title = invoice ? "Invoices" : "Bills";
+    t.title = documentListTitle(kind);
     if (openOnly) t.title += " (open)";
-    t.headers = {"Number", "Date", "Due", invoice ? "Customer" : "Vendor", "Total", "Balance", "Status"};
+    const char* dueHeader = kind == DocKind::Estimate ? "Expires" : docHasDueDate(kind) ? "Due" : "";
+    const char* balanceHeader = kind == DocKind::CreditMemo ? "Credit Left" : "Balance";
+    t.headers = {"Number", "Date", dueHeader, partyKind(kind) == ContactKind::Customer ? "Customer" : "Vendor",
+                 "Total", balanceHeader, "Status"};
     t.numeric = {false, false, false, false, true, true, false};
     Money total;
     Money open;
     for (const auto& d : b.documents()) {
         if (d.kind != kind || (contactId && d.contactId != contactId)) continue;
+        if (openOnly && !documentIsOpen(b, d)) continue;
         const Money balance = b.documentBalance(d.id);
-        if (openOnly && (d.voided || balance.isZero())) continue;
-        std::string status;
-        if (d.voided) status = "Void";
-        else if (balance.isZero()) status = "Paid";
-        else if (d.dueDate < today) status = "Overdue";
-        else if (balance < d.total()) status = "Partial";
-        else status = "Open";
         const Money docTotal = d.voided ? Money() : d.total();
         total += docTotal;
         open += balance;
-        t.add({d.number, d.date.str(), d.dueDate.str(), b.contact(d.contactId).name, docTotal.formatted(),
-               balance.formatted(), status});
+        t.add({d.number, d.date.str(), docHasDueDate(kind) ? d.dueDate.str() : "", b.contact(d.contactId).name,
+               docTotal.formatted(), balance.formatted(), documentStatus(b, d, today)});
     }
     t.add({"Total", "", "", "", total.formatted(), open.formatted(), ""}, RowStyle::Total);
+    return t;
+}
+
+Table recurringList(const Book& b, Date today) {
+    Table t;
+    t.title = "Recurring Invoices";
+    t.headers = {"Name", "Customer", "Schedule", "Next", "Created", "Amount", "Status"};
+    t.numeric = {false, false, false, false, true, true, false};
+    for (const auto& r : b.recurringInvoices()) {
+        std::string status = !r.active ? "Paused" : r.finished() ? "Finished" : r.nextDate() <= today ? "Due" : "Active";
+        t.add({r.name, b.contact(r.contactId).name, r.scheduleText(), r.finished() ? "" : r.nextDate().str(),
+               std::to_string(r.occurrencesCreated), r.total().formatted(), status});
+    }
     return t;
 }
 
@@ -523,6 +573,16 @@ Table agingReport(const Book& b, DocKind kind, Date asOf) {
         row[0] -= credit;  // unapplied payments are shown as credits in the current column
         row[5] -= credit;
     }
+    if (invoice) {  // so are credit memos not yet applied to an invoice
+        for (const auto& cm : b.documents()) {
+            if (cm.kind != DocKind::CreditMemo || cm.voided || cm.date > asOf) continue;
+            const Money credit = b.documentBalance(cm.id);
+            if (credit.isZero()) continue;
+            Buckets& row = byContact[cm.contactId];
+            row[0] -= credit;
+            row[5] -= credit;
+        }
+    }
 
     std::vector<std::pair<std::string, Buckets>> rows;
     for (const auto& [contactId, buckets] : byContact) rows.emplace_back(b.contact(contactId).name, buckets);
@@ -576,19 +636,20 @@ Table journalReport(const Book& b, const Period& period) {
 std::string renderDocument(const Book& b, int documentId) {
     const Document& d = b.document(documentId);
     const Contact& c = b.contact(d.contactId);
-    const bool invoice = d.kind == DocKind::Invoice;
     std::ostringstream out;
 
     out << b.company.name << '\n';
     if (!b.company.address.empty()) out << b.company.address << '\n';
-    out << '\n' << (invoice ? "INVOICE " : "BILL ") << d.number << (d.voided ? "   ** VOID **" : "") << "\n\n";
-    out << (invoice ? "Bill to:  " : "Vendor:   ") << c.name << '\n';
+    out << '\n' << toUpper(docTitle(d.kind)) << " " << d.number << (d.voided ? "   ** VOID **" : "") << "\n\n";
+    out << (d.kind == DocKind::Bill ? "Vendor:   " : "Customer: ") << c.name << '\n';
     if (!c.address.empty()) {
         for (const auto& line : split(c.address, '\n')) out << "          " << line << '\n';
     }
     if (!c.email.empty()) out << "          " << c.email << '\n';
     out << "Date:     " << d.date << '\n';
-    out << "Due:      " << d.dueDate << '\n';
+    if (d.kind == DocKind::Estimate) out << "Expires:  " << d.dueDate << "\nStatus:   " << documentStatus(b, d, Date::today()) << '\n';
+    else if (docHasDueDate(d.kind)) out << "Due:      " << d.dueDate << '\n';
+    if (d.kind == DocKind::SalesReceipt && d.depositAccountId) out << "Paid to:  " << b.account(d.depositAccountId).name << '\n';
     if (!d.memo.empty()) out << "Memo:     " << d.memo << '\n';
     out << '\n';
 
@@ -602,11 +663,25 @@ std::string renderDocument(const Book& b, int documentId) {
     t.add({"Subtotal", "", "", "", d.subtotal().formatted()}, RowStyle::Total);
     if (!d.tax().isZero()) t.add({"Sales tax (" + d.taxRate.str() + "%)", "", "", "", d.tax().formatted()});
     t.add({"Total", "", "", "", d.total().formatted()});
-    const Money paid = b.documentPaid(documentId);
-    if (!paid.isZero()) t.add({"Payments applied", "", "", "", (-paid).formatted()});
-    t.add({"Balance due", "", "", "", b.documentBalance(documentId).formatted()}, RowStyle::Total);
+    if (d.kind == DocKind::Invoice || d.kind == DocKind::Bill) {
+        const Money paid = b.documentPaid(documentId);
+        const Money credited = b.documentCredited(documentId);
+        if (!paid.isZero()) t.add({"Payments applied", "", "", "", (-paid).formatted()});
+        if (!credited.isZero()) t.add({"Credits applied", "", "", "", (-credited).formatted()});
+        t.add({"Balance due", "", "", "", b.documentBalance(documentId).formatted()}, RowStyle::Total);
+    } else if (d.kind == DocKind::CreditMemo) {
+        for (const auto& a : d.applications)
+            t.add({"Applied to invoice " + b.document(a.documentId).number, "", "", "", (-a.amount).formatted()});
+        t.add({"Credit remaining", "", "", "", b.documentBalance(documentId).formatted()}, RowStyle::Total);
+    }
     out << renderText(t);
     return out.str();
+}
+
+std::string toUpper(std::string_view s) {
+    std::string out(s);
+    for (char& ch : out) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    return out;
 }
 
 }  // namespace ob

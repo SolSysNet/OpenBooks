@@ -691,6 +691,259 @@ TEST(company_fields_round_trip_and_old_files_load) {
     CHECK(legacy.company.paperSize == PaperSize::Letter);
 }
 
+// ------------------------------------------------ estimates, credits, receipts
+
+Document salesDoc(const Fixture& f, DocKind kind, const char* date, Money rate, Decimal taxRate = Decimal()) {
+    Document d;
+    d.kind = kind;
+    d.contactId = f.acme;
+    d.date = D(date);
+    d.dueDate = d.date.addDays(30);
+    d.taxRate = taxRate;
+    DocLine l;
+    l.accountId = f.service;
+    l.description = "Work";
+    l.rate = rate;
+    d.lines.push_back(l);
+    return d;
+}
+
+TEST(date_add_months_clamps) {
+    CHECK_EQ(D("2025-01-31").addMonths(1).str(), std::string("2025-02-28"));
+    CHECK_EQ(D("2024-01-31").addMonths(1).str(), std::string("2024-02-29"));
+    CHECK_EQ(D("2025-01-31").addMonths(2).str(), std::string("2025-03-31"));
+    CHECK_EQ(D("2025-11-15").addMonths(3).str(), std::string("2026-02-15"));
+    CHECK_EQ(D("2025-03-15").addMonths(-4).str(), std::string("2024-11-15"));
+    CHECK_EQ(D("2024-02-29").addMonths(12).str(), std::string("2025-02-28"));
+}
+
+TEST(estimates_do_not_post_and_convert_to_invoices) {
+    Fixture f;
+    const int est = f.b.createDocument(salesDoc(f, DocKind::Estimate, "2026-03-01", M("500"), Q("10")));
+    const Document& e = f.b.document(est);
+    CHECK_EQ(e.number, std::string("EST-1"));
+    CHECK_EQ(e.txnId, 0);
+    CHECK(f.b.transactions().empty());
+    CHECK(f.b.documentBalance(est).isZero());
+    CHECK(f.b.contactBalance(f.acme).isZero());
+    CHECK_EQ(documentStatus(f.b, f.b.document(est), D("2026-03-05")), std::string("Pending"));
+    CHECK_EQ(documentStatus(f.b, f.b.document(est), D("2026-05-01")), std::string("Expired"));
+
+    f.b.setEstimateStatus(est, EstimateStatus::Accepted);
+    const int inv = f.b.convertEstimate(est, D("2026-03-10"));
+    CHECK_EQ(f.b.document(inv).total(), M("550.00"));
+    CHECK_EQ(f.b.document(inv).linkedDocId, est);
+    CHECK(f.b.estimateStatus(est) == EstimateStatus::Converted);
+    CHECK_EQ(f.b.balance(f.ar), M("550.00"));
+    CHECK_THROWS(f.b.convertEstimate(est, D("2026-03-11")));                 // only once
+    CHECK_THROWS(f.b.setEstimateStatus(est, EstimateStatus::Declined));      // already converted
+
+    // Voiding the invoice frees the estimate to be converted again.
+    f.b.voidDocument(inv);
+    CHECK(f.b.estimateStatus(est) == EstimateStatus::Accepted);
+    f.b.convertEstimate(est, D("2026-03-12"));
+    CHECK(f.b.estimateStatus(est) == EstimateStatus::Converted);
+}
+
+TEST(credit_memos_reduce_receivables_and_apply_to_invoices) {
+    Fixture f;
+    const int inv = f.invoice("2026-01-05", M("300"), Decimal::fromInt(1), Q("10"));  // 330.00
+    const int cm = f.b.createDocument(salesDoc(f, DocKind::CreditMemo, "2026-01-10", M("100"), Q("10")));  // 110.00
+    CHECK_EQ(f.b.document(cm).number, std::string("CM-1"));
+    CHECK_EQ(f.b.balance(f.ar), M("220.00"));
+    CHECK_EQ(f.b.balance(f.service), M("-200.00"));   // income reduced
+    CHECK_EQ(f.b.balance(f.tax), M("-20.00"));        // tax reduced
+    CHECK_EQ(f.b.documentBalance(cm), M("110.00"));   // credit available
+    CHECK_EQ(f.b.contactBalance(f.acme), M("220.00"));
+
+    CHECK_THROWS(f.b.applyCredit(cm, inv, M("120")));  // more than the credit
+    f.b.applyCredit(cm, inv, M("60"));
+    f.b.applyCredit(cm, inv, M("50"));
+    CHECK_EQ(f.b.documentBalance(inv), M("220.00"));
+    CHECK_EQ(f.b.documentBalance(cm), M("0.00"));
+    CHECK_EQ(f.b.document(cm).applications.size(), std::size_t(1));  // merged
+    CHECK_EQ(f.b.contactBalance(f.acme), M("220.00"));                // unchanged by applying
+    CHECK_THROWS(f.b.voidDocument(inv));                               // credit applied
+
+    // A payment now only needs to cover what is left.
+    f.receive("2026-01-20", M("220"));
+    CHECK(f.b.documentBalance(inv).isZero());
+    CHECK_EQ(documentStatus(f.b, f.b.document(inv), D("2026-01-20")), std::string("Paid"));
+    CHECK(sumOfAllBalances(f.b).isZero());
+
+    // Another customer's invoice can't take this credit.
+    Contact other;
+    other.kind = ContactKind::Customer;
+    other.name = "Other";
+    const int otherId = f.b.addContact(other);
+    Document od = salesDoc(f, DocKind::Invoice, "2026-01-05", M("10"));
+    od.contactId = otherId;
+    const int otherInv = f.b.createDocument(od);
+    const int cm2 = f.b.createDocument(salesDoc(f, DocKind::CreditMemo, "2026-01-11", M("5")));
+    CHECK_THROWS(f.b.applyCredit(cm2, otherInv, M("5")));
+}
+
+TEST(voiding_or_unapplying_a_credit_reopens_the_invoice) {
+    Fixture f;
+    const int inv = f.invoice("2026-01-05", M("100"));
+    const int cm = f.b.createDocument(salesDoc(f, DocKind::CreditMemo, "2026-01-06", M("40")));
+    f.b.applyCredit(cm, inv, M("40"));
+    CHECK_EQ(f.b.documentBalance(inv), M("60"));
+    f.b.unapplyCredit(cm, inv);
+    CHECK_EQ(f.b.documentBalance(inv), M("100"));
+    CHECK_THROWS(f.b.unapplyCredit(cm, inv));
+    f.b.applyCredit(cm, inv, M("40"));
+    f.b.voidDocument(cm);
+    CHECK_EQ(f.b.documentBalance(inv), M("100"));
+    CHECK_EQ(f.b.balance(f.ar), M("100"));
+    f.b.voidDocument(inv);  // nothing applied any more
+}
+
+TEST(unapplied_credits_show_in_ar_aging) {
+    Fixture f;
+    f.invoice("2026-01-01", M("100"));
+    f.b.createDocument(salesDoc(f, DocKind::CreditMemo, "2026-01-02", M("30")));
+    const Table aging = agingReport(f.b, DocKind::Invoice, D("2026-01-15"));
+    const Row* row = aging.find("Acme Corp");
+    CHECK(row && row->cells[1] == "70.00");  // 100 current - 30 credit
+    CHECK(row && row->cells[6] == "70.00");
+    CHECK_EQ(f.b.balance(f.ar), M("70.00"));
+}
+
+TEST(sales_receipts_deposit_directly) {
+    Fixture f;
+    Document d = salesDoc(f, DocKind::SalesReceipt, "2026-02-01", M("80"), Q("5"));
+    d.depositAccountId = f.ar;
+    CHECK_THROWS(f.b.createDocument(d));  // must be a bank account
+    d.depositAccountId = 0;
+    CHECK_THROWS(f.b.createDocument(d));  // and one must be chosen
+    d.depositAccountId = f.checking;
+    const int id = f.b.createDocument(d);
+    CHECK_EQ(f.b.document(id).number, std::string("SR-1"));
+    CHECK_EQ(f.b.balance(f.checking), M("84.00"));
+    CHECK_EQ(f.b.balance(f.service), M("-80.00"));
+    CHECK_EQ(f.b.balance(f.tax), M("-4.00"));
+    CHECK(f.b.balance(f.ar).isZero());
+    CHECK(f.b.documentBalance(id).isZero());
+    CHECK(f.b.document(id).dueDate == f.b.document(id).date);
+    f.b.voidDocument(id);
+    CHECK(f.b.balance(f.checking).isZero());
+}
+
+TEST(recurring_invoices_follow_their_schedule) {
+    Fixture f;
+    RecurringInvoice r;
+    r.name = "Monthly retainer";
+    r.contactId = f.acme;
+    r.startDate = D("2026-01-31");
+    r.endDate = D("2026-05-15");
+    DocLine l;
+    l.accountId = f.service;
+    l.description = "Retainer";
+    l.rate = M("1000");
+    r.lines.push_back(l);
+    const int id = f.b.addRecurring(r);
+    CHECK_EQ(f.b.recurringInvoice(id).total(), M("1000.00"));
+    CHECK_EQ(f.b.dueRecurringCount(D("2026-03-31")), 3);
+
+    const auto first = f.b.createDueRecurringInvoices(D("2026-03-31"));
+    CHECK_EQ(first.size(), std::size_t(3));
+    if (first.size() == 3) {
+        CHECK_EQ(f.b.document(first[0]).date.str(), std::string("2026-01-31"));
+        CHECK_EQ(f.b.document(first[1]).date.str(), std::string("2026-02-28"));
+        CHECK_EQ(f.b.document(first[2]).date.str(), std::string("2026-03-31"));
+        CHECK_EQ(f.b.document(first[2]).recurringId, id);
+    }
+    CHECK(f.b.createDueRecurringInvoices(D("2026-03-31")).empty());  // idempotent
+    CHECK_EQ(f.b.createDueRecurringInvoices(D("2026-12-31")).size(), std::size_t(1));  // Apr 30 only; ends May 15
+    CHECK(f.b.recurringInvoice(id).finished());
+    CHECK_EQ(f.b.balance(f.ar), M("4000.00"));
+
+    RecurringInvoice weekly = r;
+    weekly.name = "Weekly cleaning";
+    weekly.frequency = Frequency::Weekly;
+    weekly.interval = 2;
+    weekly.startDate = D("2026-06-01");
+    weekly.endDate.reset();
+    const int w = f.b.addRecurring(weekly);
+    CHECK_EQ(f.b.recurringInvoice(w).occurrence(3).str(), std::string("2026-07-13"));
+    RecurringInvoice paused = f.b.recurringInvoice(w);
+    paused.active = false;
+    f.b.updateRecurring(paused);
+    CHECK_EQ(f.b.dueRecurringCount(D("2026-12-31")), 0);
+    CHECK_THROWS(f.b.addRecurring(r));  // duplicate name
+}
+
+TEST(recurring_run_is_all_or_nothing) {
+    Fixture f;
+    RecurringInvoice r;
+    r.name = "Retainer";
+    r.contactId = f.acme;
+    r.startDate = D("2026-01-01");
+    DocLine l;
+    l.accountId = f.service;
+    l.rate = M("10");
+    r.lines.push_back(l);
+    f.b.addRecurring(r);
+    f.b.company.closedThrough = D("2026-01-31");  // the January invoice can't be created
+    const std::size_t before = f.b.documents().size();
+    CHECK_THROWS(f.b.createDueRecurringInvoices(D("2026-03-31")));
+    CHECK_EQ(f.b.documents().size(), before);
+    CHECK_EQ(f.b.recurringInvoices().front().occurrencesCreated, 0);
+
+    RecurringInvoice ancient = r;
+    ancient.name = "Ancient";
+    ancient.frequency = Frequency::Weekly;
+    ancient.startDate = D("1990-01-01");
+    f.b.company.closedThrough.reset();
+    f.b.addRecurring(ancient);
+    CHECK_THROWS(f.b.createDueRecurringInvoices(D("2026-03-31")));  // runaway guard
+}
+
+TEST(new_document_kinds_round_trip_and_render) {
+    Fixture f;
+    const int inv = f.invoice("2026-01-05", M("100"));
+    const int est = f.b.createDocument(salesDoc(f, DocKind::Estimate, "2026-01-01", M("100")));
+    f.b.setEstimateStatus(est, EstimateStatus::Declined);
+    const int cm = f.b.createDocument(salesDoc(f, DocKind::CreditMemo, "2026-01-06", M("25")));
+    f.b.applyCredit(cm, inv, M("25"));
+    Document sr = salesDoc(f, DocKind::SalesReceipt, "2026-01-07", M("12"));
+    sr.depositAccountId = f.checking;
+    const int receipt = f.b.createDocument(sr);
+    RecurringInvoice r;
+    r.name = "Tab\there";
+    r.contactId = f.acme;
+    r.startDate = D("2026-01-01");
+    r.endDate = D("2026-12-31");
+    r.lines = f.b.document(inv).lines;
+    f.b.addRecurring(r);
+    f.b.createDueRecurringInvoices(D("2026-02-01"));
+
+    std::stringstream first;
+    f.b.write(first);
+    CHECK(first.str().rfind("OPENBOOKS\t2\n", 0) == 0);
+    std::stringstream in(first.str());
+    const Book loaded = Book::read(in);
+    std::stringstream second;
+    loaded.write(second);
+    CHECK_EQ(first.str(), second.str());
+    CHECK_EQ(loaded.documentBalance(inv), M("75.00"));
+    CHECK(loaded.estimateStatus(est) == EstimateStatus::Declined);
+    CHECK_EQ(loaded.document(receipt).depositAccountId, f.checking);
+    CHECK_EQ(loaded.recurringInvoices().front().occurrencesCreated, 2);
+    CHECK_EQ(loaded.company.nextCreditMemoNumber, 2);
+
+    for (int id : {est, cm, receipt}) {
+        const std::string pdfOut = documentPdf(loaded, id);
+        CHECK(pdfStructureValid(pdfOut, nullptr));
+        CHECK(noActiveContent(pdfOut));
+    }
+    CHECK(documentPdf(loaded, est).find("(ESTIMATE)") != std::string::npos);
+    CHECK(documentPdf(loaded, cm).find("(CREDIT REMAINING)") != std::string::npos);
+    CHECK(documentPdf(loaded, receipt).find("(PAID)") != std::string::npos);
+    CHECK(documentPdfFileName(loaded, cm).rfind("Credit Memo CM-1", 0) == 0);
+}
+
 // -------------------------------------------------------------------- CLI
 
 struct CliRun {
@@ -772,6 +1025,27 @@ TEST(cli_end_to_end) {
 
     r = cli(file, {"report", "trial-balance", "--csv"});
     CHECK(r.out.find("Account,Debit,Credit") == 0);
+
+    // Estimates, credit memos, sales receipts and recurring invoices.
+    r = cli(file, {"estimate", "create", "--customer", "Acme", "--date", "2025-02-01", "--line", "item=Consulting;qty=2"});
+    CHECK(r.out.find("EST-1") != std::string::npos);
+    CHECK_EQ(cli(file, {"estimate", "accept", "EST-1"}).code, 0);
+    r = cli(file, {"estimate", "convert", "EST-1", "--date", "2025-02-02"});
+    CHECK(r.out.find("to invoice 1002") != std::string::npos);
+    r = cli(file, {"credit-memo", "create", "--customer", "Acme", "--date", "2025-02-03", "--line",
+                   "desc=Discount;amount=50;account=Service Revenue", "--apply", "1002"});
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.find("applied 50.00 to invoice 1002") != std::string::npos);
+    r = cli(file, {"sales-receipt", "create", "--customer", "Acme", "--deposit-to", "Checking", "--date", "2025-02-04",
+                   "--line", "desc=Walk-in;amount=20;account=Sales"});
+    CHECK(r.out.find("SR-1") != std::string::npos);
+    CHECK_EQ(cli(file, {"recurring", "add", "Monthly", "--customer", "Acme", "--start", "2025-01-15", "--end",
+                        "2025-03-31", "--line", "desc=Hosting;amount=30;account=Sales"}).code, 0);
+    r = cli(file, {"recurring", "run", "--through", "2025-06-30"});
+    CHECK(r.out.find("3 invoice(s) created") != std::string::npos);
+    CHECK(cli(file, {"recurring", "list"}).out.find("Finished") != std::string::npos);
+    r = cli(file, {"report", "balance-sheet", "--as-of", "2025-12-31"});
+    CHECK(r.out.find("WARNING") == std::string::npos);
 
     // PDF export refuses to overwrite unless forced.
     const std::string pdfPath = (dir / "inv.pdf").string();

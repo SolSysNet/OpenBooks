@@ -1,6 +1,7 @@
 #include "app.hpp"
 
 #include "imgui.h"
+#include "imgui_internal.h"  // ErrorRecoveryStoreState / TryToRecoverState
 #include "openbooks/cli.hpp"
 #include "openbooks/util.hpp"
 #include "platform.hpp"
@@ -28,12 +29,34 @@ constexpr float kNoticeSeconds = 6.0f;
 
 fs::path pathFromUtf8(const std::string& s) { return fs::u8path(s); }
 
+// A recent-files entry must be printable UTF-8 that converts to a path; anything else
+// (e.g. a corrupted config) is ignored rather than trusted.
+bool validRecentPath(const std::string& s) {
+    if (s.empty() || s.size() > 4096) return false;
+    for (char ch : s) {
+        if (static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F) return false;
+    }
+    try {
+        (void)fs::u8path(s);
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
 // The same file spelled differently (case on Windows, "..", slashes) counts once in Recent.
 bool samePath(const std::string& a, const std::string& b) {
-    std::error_code ec;
-    if (fs::equivalent(fs::u8path(a), fs::u8path(b), ec)) return true;
-    const std::string na = fs::u8path(a).lexically_normal().u8string();
-    const std::string nb = fs::u8path(b).lexically_normal().u8string();
+    if (a == b) return true;
+    std::string na;
+    std::string nb;
+    try {
+        std::error_code ec;
+        if (fs::equivalent(fs::u8path(a), fs::u8path(b), ec)) return true;
+        na = fs::u8path(a).lexically_normal().u8string();
+        nb = fs::u8path(b).lexically_normal().u8string();
+    } catch (const std::exception&) {
+        return false;
+    }
 #ifdef _WIN32
     return iequals(na, nb);
 #else
@@ -76,8 +99,9 @@ App::App(std::string initialPath) {
     if (!initialPath.empty()) {
         openBooks(initialPath);
     } else if (!recent_.empty()) {
+        const std::string last = recent_.front();  // a copy: openBooks() reorders recent_
         std::error_code ec;
-        if (fs::exists(pathFromUtf8(recent_.front()), ec)) openBooks(recent_.front());
+        if (validRecentPath(last) && fs::exists(pathFromUtf8(last), ec)) openBooks(last);
     }
 }
 
@@ -92,19 +116,35 @@ void App::loadConfig() {
         const std::string key = line.substr(0, eq);
         const std::string value = line.substr(eq + 1);
         if (key == "theme") darkTheme_ = value == "dark";
-        if (key == "recent" && !value.empty() && recent_.size() < 8 &&
+        if (key == "recent" && validRecentPath(value) && recent_.size() < 8 &&
             std::none_of(recent_.begin(), recent_.end(), [&](const std::string& r) { return samePath(r, value); }))
             recent_.push_back(value);
     }
 }
 
 void App::saveConfig() const {
-    std::ofstream out(pathFromUtf8(configPath_), std::ios::trunc);
-    out << "theme=" << (darkTheme_ ? "dark" : "light") << '\n';
-    for (const auto& r : recent_) out << "recent=" << r << '\n';
+    // Write a temporary file and rename it over the old one, so a crash mid-write can't leave
+    // a truncated config behind.
+    const fs::path target = pathFromUtf8(configPath_);
+    fs::path tmp = target;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        out << "theme=" << (darkTheme_ ? "dark" : "light") << '\n';
+        for (const auto& r : recent_) {
+            if (validRecentPath(r)) out << "recent=" << r << '\n';
+        }
+        if (!out) return;
+    }
+    std::error_code ec;
+    fs::rename(tmp, target, ec);
+    if (ec) {
+        fs::remove(target, ec);
+        fs::rename(tmp, target, ec);
+    }
 }
 
-void App::rememberRecent(const std::string& path) {
+void App::rememberRecent(std::string path) {  // by value: `path` may alias an element of recent_
     recent_.erase(std::remove_if(recent_.begin(), recent_.end(), [&](const std::string& r) { return samePath(r, path); }),
                   recent_.end());
     recent_.insert(recent_.begin(), path);
@@ -112,7 +152,7 @@ void App::rememberRecent(const std::string& path) {
     saveConfig();
 }
 
-bool App::openBooks(const std::string& path) {
+bool App::openBooks(std::string path) {  // by value, see rememberRecent()
     try {
         Book loaded = Book::load(path);
         book_ = std::move(loaded);
@@ -126,6 +166,10 @@ bool App::openBooks(const std::string& path) {
     customers_ = {};
     vendors_ = {};
     invoices_ = {};
+    estimates_ = {};
+    creditMemos_ = {};
+    salesReceipts_ = {};
+    recurringList_ = {};
     bills_ = {};
     payments_ = {};
     accountsList_ = {};
@@ -169,15 +213,29 @@ const Derived& App::derived() {
     const Book& b = *book_;
     Derived d;
     d.version = version_;
+    // Same rules as Book::documentBalance, computed in one pass instead of per document.
     for (const auto& doc : b.documents()) {
-        if (!doc.voided) d.documentBalance[doc.id] = doc.total();
+        if (doc.voided) continue;
+        if (doc.kind == DocKind::Invoice || doc.kind == DocKind::Bill || doc.kind == DocKind::CreditMemo)
+            d.documentBalance[doc.id] = doc.total();
     }
     for (const auto& p : b.payments()) {
         if (p.voided) continue;
         for (const auto& a : p.applications) d.documentBalance[a.documentId] -= a.amount;
     }
+    for (const auto& cm : b.documents()) {
+        if (cm.kind != DocKind::CreditMemo || cm.voided) continue;
+        for (const auto& a : cm.applications) {
+            d.documentBalance[a.documentId] -= a.amount;  // the invoice owes less
+            d.documentBalance[cm.id] -= a.amount;         // the credit has less left
+        }
+    }
     for (const auto& doc : b.documents()) {
-        if (!doc.voided) d.contactBalance[doc.contactId] += d.documentBalance[doc.id];
+        if (doc.voided) continue;
+        const auto it = d.documentBalance.find(doc.id);
+        if (it == d.documentBalance.end()) continue;
+        if (doc.kind == DocKind::CreditMemo) d.contactBalance[doc.contactId] -= it->second;
+        else d.contactBalance[doc.contactId] += it->second;
     }
     for (const auto& p : b.payments()) {
         if (!p.voided) d.contactBalance[p.contactId] -= p.unapplied();
@@ -230,7 +288,27 @@ void App::chooseOpenFile() {
 
 // ----------------------------------------------------------------- frame
 
+// Draws one frame. Any exception thrown while drawing (a bug, or data the UI didn't expect)
+// is caught here: ImGui's window stack is unwound, the user sees the message, and the app
+// keeps running instead of aborting. The books themselves are never left half-changed,
+// because every change goes through commit().
 void App::frame() {
+    ImGuiErrorRecoveryState recovery;
+    ImGui::ErrorRecoveryStoreState(&recovery);
+    try {
+        drawFrame();
+    } catch (const std::exception& e) {
+        ImGuiIO& io = ImGui::GetIO();
+        const bool asserts = io.ConfigErrorRecoveryEnableAssert;
+        io.ConfigErrorRecoveryEnableAssert = false;  // we are recovering on purpose
+        ImGui::ErrorRecoveryTryToRecoverState(&recovery);
+        io.ConfigErrorRecoveryEnableAssert = asserts;
+        notify(std::string("Something went wrong: ") + e.what(), true);
+        if (book_) screen_ = Screen::Dashboard;  // don't keep re-entering the failing screen
+    }
+}
+
+void App::drawFrame() {
     drawMenuBar();
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -278,6 +356,10 @@ void App::frame() {
             case Screen::Reports: drawReports(); break;
             case Screen::Company: drawCompany(); break;
             case Screen::DocumentEditor: drawDocumentEditor(); break;
+            case Screen::Estimates: drawDocuments(DocKind::Estimate); break;
+            case Screen::CreditMemos: drawDocuments(DocKind::CreditMemo); break;
+            case Screen::SalesReceipts: drawDocuments(DocKind::SalesReceipt); break;
+            case Screen::Recurring: drawRecurring(); break;
         }
         ImGui::EndChild();
         ImGui::PopStyleVar();
@@ -313,7 +395,11 @@ void App::drawMenuBar() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Create", open)) {
+        if (ImGui::MenuItem("Estimate")) startDocument(DocKind::Estimate, 0, Screen::Estimates);
         if (ImGui::MenuItem("Invoice")) startDocument(DocKind::Invoice, 0, Screen::Invoices);
+        if (ImGui::MenuItem("Sales Receipt")) startDocument(DocKind::SalesReceipt, 0, Screen::SalesReceipts);
+        if (ImGui::MenuItem("Credit Memo")) startDocument(DocKind::CreditMemo, 0, Screen::CreditMemos);
+        if (ImGui::MenuItem("Recurring Invoice")) startRecurringEditor(0);
         if (ImGui::MenuItem("Receive Payment")) startPayment(PaymentKind::Received, 0);
         ImGui::Separator();
         if (ImGui::MenuItem("Bill")) startDocument(DocKind::Bill, 0, Screen::Bills);
@@ -356,7 +442,14 @@ void App::drawSidebar() {
     };
     static const std::vector<Group> groups = {
         {"OVERVIEW", {{"Dashboard", Screen::Dashboard}, {"Reports", Screen::Reports}}},
-        {"SALES", {{"Customers", Screen::Customers}, {"Invoices", Screen::Invoices}, {"Receive Payment", Screen::ReceivePayment}}},
+        {"SALES",
+         {{"Customers", Screen::Customers},
+          {"Estimates", Screen::Estimates},
+          {"Invoices", Screen::Invoices},
+          {"Sales Receipts", Screen::SalesReceipts},
+          {"Credit Memos", Screen::CreditMemos},
+          {"Recurring Invoices", Screen::Recurring},
+          {"Receive Payment", Screen::ReceivePayment}}},
         {"PURCHASES", {{"Vendors", Screen::Vendors}, {"Bills", Screen::Bills}, {"Pay Bills", Screen::PayBills}}},
         {"BANKING", {{"Registers", Screen::Register}, {"Reconcile", Screen::Reconcile}, {"Payments", Screen::Payments}}},
         {"ACCOUNTING", {{"Chart of Accounts", Screen::Accounts}, {"Journal Entry", Screen::Journal},
@@ -542,6 +635,7 @@ void App::drawModals() {
     drawImportModal();
     drawRecategorizeModal();
     drawTransactionModal();
+    drawApplyCreditModal();
 }
 
 // ------------------------------------------------------------- dashboard
@@ -570,6 +664,27 @@ void App::drawDashboard() {
         if (ImGui::Button(labels[3])) openQuickEntry(TxnKind::Expense);
     }
     ui::Muted(("Today is " + today.str()).c_str());
+
+    // Recurring invoices waiting to be created.
+    if (const int due = b.dueRecurringCount(today); due > 0) {
+        ImGui::Dummy(ImVec2(0, 4));
+        ImVec4 bg = colorWarning();
+        bg.w = 0.14f;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+        ImGui::BeginChild("##recurringDue", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY);
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("%d recurring invoice%s due.", due, due == 1 ? " is" : "s are");
+        ImGui::SameLine();
+        bool create = ui::PrimaryButton("Create now");
+        ImGui::SameLine();
+        if (ImGui::Button("Review")) go(Screen::Recurring);
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        if (create) {
+            createDueRecurring();
+            return;
+        }
+    }
     ImGui::Dummy(ImVec2(0, 10));
 
     // Figures.
@@ -616,9 +731,11 @@ void App::drawDashboard() {
                 overdue += bal;
                 ++overdueCount;
             }
-        } else {
+        } else if (doc.kind == DocKind::Bill) {
             payable += bal;
             if (doc.dueDate < today) billsOverdue += bal;
+        } else if (doc.kind == DocKind::CreditMemo) {
+            receivable -= bal;  // unapplied customer credit
         }
     }
     const Date fyStart = b.fiscalYearStart(today);

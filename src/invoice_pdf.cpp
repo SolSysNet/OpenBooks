@@ -1,6 +1,7 @@
 #include "openbooks/invoice_pdf.hpp"
 
 #include "openbooks/pdf.hpp"
+#include "openbooks/reports.hpp"
 #include "openbooks/util.hpp"
 
 #include <algorithm>
@@ -37,7 +38,7 @@ std::vector<std::string> lines(const std::string& text) {
 
 std::string documentPdfFileName(const Book& book, int documentId) {
     const Document& d = book.document(documentId);
-    const std::string raw = std::string(d.kind == DocKind::Invoice ? "Invoice " : "Bill ") + d.number + " - " +
+    const std::string raw = std::string(docTitle(d.kind)) + " " + d.number + " - " +
                             book.contact(d.contactId).name;
     std::string name;
     for (char ch : raw) {
@@ -57,13 +58,15 @@ std::string documentPdf(const Book& book, int documentId) {
     const Document& d = book.document(documentId);
     const Contact& contact = book.contact(d.contactId);
     const Company& company = book.company;
-    const bool invoice = d.kind == DocKind::Invoice;
+    const DocKind kind = d.kind;
+    const std::string title = docTitle(kind);
     const Money paid = book.documentPaid(documentId);
+    const Money credited = book.documentCredited(documentId);
     const Money balance = book.documentBalance(documentId);
 
     const pdf::PageSize size = company.paperSize == PaperSize::A4 ? pdf::kA4 : pdf::kLetter;
     pdf::Document doc(size);
-    doc.setTitle(std::string(invoice ? "Invoice " : "Bill ") + d.number);
+    doc.setTitle(title + " " + d.number);
     doc.setAuthor(company.name);
 
     const double left = kMargin;
@@ -81,7 +84,8 @@ std::string documentPdf(const Book& book, int documentId) {
     // ---- stamp (drawn first so it sits behind the content)
     if (d.voided) {
         page->rotatedText(size.width / 2, size.height / 2, 30, "VOID", Font::Bold, 110, Color{0.98, 0.84, 0.84});
-    } else if (balance.isZero() && d.total() > Money()) {
+    } else if (kind == DocKind::SalesReceipt ||
+               ((kind == DocKind::Invoice || kind == DocKind::Bill) && balance.isZero() && d.total() > Money())) {
         page->rotatedText(size.width / 2, size.height / 2, 30, "PAID", Font::Bold, 110, Color{0.86, 0.94, 0.85});
     }
 
@@ -97,16 +101,17 @@ std::string documentPdf(const Book& book, int documentId) {
         companyY -= 12;
     }
 
-    page->text(right, y - 6, invoice ? "INVOICE" : "BILL", Font::Bold, 26, kAccent, Align::Right);
+    page->text(right, y - 6, toUpper(title), Font::Bold, kind == DocKind::SalesReceipt ? 22 : 26, kAccent, Align::Right);
     double metaY = y - 32;
     auto meta = [&](const std::string& label, const std::string& value) {
         page->text(right - 96, metaY, label, Font::Regular, 9.5, kMuted, Align::Right);
         page->text(right, metaY, value, Font::Bold, 9.5, kInk, Align::Right);
         metaY -= 14;
     };
-    meta(invoice ? "Invoice #" : "Bill #", d.number);
+    meta(title + " #", d.number);
     meta("Date", d.date.str());
-    meta("Due date", d.dueDate.str());
+    if (kind == DocKind::Estimate) meta("Expires", d.dueDate.str());
+    else if (docHasDueDate(kind)) meta("Due date", d.dueDate.str());
 
     y = std::min(companyY, metaY) - 8;
     page->line(left, y, right, y, 1.5, kAccent);
@@ -116,10 +121,30 @@ std::string documentPdf(const Book& book, int documentId) {
     const double boxWidth = 180;
     const double boxTop = y + 12;
     page->fillRect(right - boxWidth, boxTop - 54, boxWidth, 54, d.voided ? kHeaderBg : kAccentLight);
-    page->text(right - boxWidth + 12, boxTop - 17, d.voided ? "VOIDED" : "BALANCE DUE", Font::Bold, kSmall, kMuted);
-    page->text(right - 12, boxTop - 42, balance.formatted(), Font::Bold, 20, kInk, Align::Right);
+    const char* boxLabel = "BALANCE DUE";
+    Money boxAmount = balance;
+    if (kind == DocKind::Estimate) {
+        boxLabel = "ESTIMATE TOTAL";
+        boxAmount = d.total();
+    } else if (kind == DocKind::CreditMemo) {
+        boxLabel = "CREDIT REMAINING";
+    } else if (kind == DocKind::SalesReceipt) {
+        boxLabel = "AMOUNT PAID";
+        boxAmount = d.total();
+    }
+    if (d.voided) {
+        boxLabel = "VOIDED";
+        boxAmount = Money();
+    }
+    page->text(right - boxWidth + 12, boxTop - 17, boxLabel, Font::Bold, kSmall, kMuted);
+    page->text(right - 12, boxTop - 42, boxAmount.formatted(), Font::Bold, 20, kInk, Align::Right);
 
-    page->text(left, y, invoice ? "BILL TO" : "VENDOR", Font::Bold, kSmall, kMuted);
+    const char* partyLabel = kind == DocKind::Bill           ? "VENDOR"
+                             : kind == DocKind::Estimate     ? "PREPARED FOR"
+                             : kind == DocKind::SalesReceipt ? "SOLD TO"
+                             : kind == DocKind::CreditMemo   ? "CUSTOMER"
+                                                             : "BILL TO";
+    page->text(left, y, partyLabel, Font::Bold, kSmall, kMuted);
     y -= 15;
     const double partyWidth = right - boxWidth - 20 - left;
     for (const auto& l : pdf::wrapText(contact.name, Font::Bold, 11, partyWidth)) {
@@ -153,7 +178,7 @@ std::string documentPdf(const Book& book, int documentId) {
         page = &doc.addPage();
         y = top;
         page->text(left, y, company.name, Font::Bold, 11, kInk);
-        page->text(right, y, std::string(invoice ? "Invoice " : "Bill ") + d.number + " (continued)", Font::Regular,
+        page->text(right, y, title + " " + d.number + " (continued)", Font::Regular,
                    9.5, kMuted, Align::Right);
         y -= 12;
         page->line(left, y, right, y, 1.0, kRule);
@@ -181,7 +206,7 @@ std::string documentPdf(const Book& book, int documentId) {
 
     // ---- totals
     const Money tax = d.tax();
-    const int totalRows = 3 + (tax.isZero() ? 0 : 1) + (paid.isZero() ? 0 : 1);
+    const int totalRows = 4 + (tax.isZero() ? 0 : 1) + (paid.isZero() ? 0 : 1) + (credited.isZero() ? 0 : 1);
     if (y - totalRows * 17.0 - 10 < bottom) newPage(false);
     y -= 4;
     const double labelRight = right - 120;
@@ -195,10 +220,32 @@ std::string documentPdf(const Book& book, int documentId) {
     totalRow("Subtotal", d.subtotal(), false);
     if (!tax.isZero()) totalRow("Sales tax (" + d.taxRate.str() + "%)", tax, false);
     totalRow("Total", d.total(), true);
-    if (!paid.isZero()) totalRow("Payments received", -paid, false);
-    y -= 5;  // clear the previous row's descenders before the highlight band
-    page->fillRect(right - 250, y - 7, 250, 22, kAccentLight);
-    totalRow("Balance due", balance, true);
+    auto highlighted = [&](const std::string& label, Money amount) {
+        y -= 5;  // clear the previous row's descenders before the highlight band
+        page->fillRect(right - 250, y - 7, 250, 22, kAccentLight);
+        totalRow(label, amount, true);
+    };
+    switch (kind) {
+        case DocKind::Invoice:
+        case DocKind::Bill:
+            if (!paid.isZero()) totalRow("Payments received", -paid, false);
+            if (!credited.isZero()) totalRow("Credits applied", -credited, false);
+            highlighted("Balance due", balance);
+            break;
+        case DocKind::CreditMemo:
+            if (!d.applications.empty()) totalRow("Applied to invoices", -d.applied(), false);
+            highlighted("Credit remaining", balance);
+            break;
+        case DocKind::SalesReceipt:
+            totalRow("Payment received", d.voided ? Money() : -d.total(), false);
+            highlighted("Balance due", Money());
+            break;
+        case DocKind::Estimate:
+            y -= 6;
+            page->text(left, y, "This estimate is valid until " + d.dueDate.str() + ".", Font::Regular, 9.5, kMuted);
+            y -= 14;
+            break;
+    }
 
     // ---- notes
     if (!trim(d.memo).empty()) {

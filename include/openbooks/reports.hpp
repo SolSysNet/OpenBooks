@@ -42,6 +42,13 @@ Table accountList(const Book& b, bool includeInactive);
 Table contactList(const Book& b, ContactKind kind, bool includeInactive);
 Table itemList(const Book& b, bool includeInactive);
 Table documentList(const Book& b, DocKind kind, bool openOnly, int contactId, Date today);
+Table recurringList(const Book& b, Date today);
+// "Open", "Overdue", "Paid", "Partial", "Void"; estimates: "Pending", "Expired", "Accepted",
+// "Declined", "Converted"; credit memos: "Unapplied", "Partly applied", "Applied".
+std::string documentStatus(const Book& b, const Document& d, Date today);
+bool documentIsOpen(const Book& b, const Document& d);
+const char* documentListTitle(DocKind kind);  // "Credit Memos"
+std::string toUpper(std::string_view s);
 Table paymentList(const Book& b, std::optional<PaymentKind> kind, int contactId);
 Table transactionList(const Book& b, const Period& period, int accountId);
 Table transactionDetail(const Book& b, int txnId);

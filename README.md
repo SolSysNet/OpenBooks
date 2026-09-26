@@ -17,8 +17,9 @@ It runs on Win32 + Direct3D 11 on Windows, and GLFW + OpenGL 3 on Linux and macO
 
 - **Dashboard:** bank balance, open and overdue invoices, open bills, fiscal-year profit,
   and recent activity.
-- **Sales:** customers, invoices with a line-item editor (products, live tax and totals),
-  and receiving payments against specific invoices.
+- **Sales:** customers, estimates (convert to an invoice in one click), invoices with a
+  line-item editor (products, live tax and totals), sales receipts, credit memos you can apply
+  to invoices, recurring invoice templates, and receiving payments against specific invoices.
 - **Purchases:** vendors, bills and bill payments.
 - **Banking:** account registers with running balances, one-click expense, deposit and
   transfer entry, CSV statement import with a preview, recategorizing from the right-click
@@ -27,8 +28,8 @@ It runs on Win32 + Direct3D 11 on Windows, and GLFW + OpenGL 3 on Linux and macO
   and services, and company settings, including closing the books.
 - **Reports:** Profit & Loss, Balance Sheet, Trial Balance, A/R and A/P Aging, Journal and
   Account Detail. Each has date presets and can be exported to CSV or copied as text.
-- **Interface:** light and dark themes, type-to-search pickers, a calendar date picker, and
-  recent files.
+- **Interface:** light and dark themes, type-to-search pickers, a calendar date picker, native
+  file dialogs (Windows; zenity/kdialog on Linux; the system panel on macOS), and recent files.
 
 Every change is saved the moment you make it, and failed changes are never half-applied.
 Open a file with `openbooks-gui path\to\books.obk`, or use File → Open.
@@ -39,7 +40,11 @@ Open a file with `openbooks-gui path\to\books.obk`, or use File → Open.
 |---|---|
 | **Double-entry ledger** | Every transaction must balance. Exact integer-cent money math, never floating point. |
 | **Chart of accounts** | Assets, liabilities, equity, income and expenses, with a ready-made starter chart. Account numbers are optional. You can deactivate accounts. |
-| **Customers & invoicing** | Invoices with products/services, quantities, per-line taxability and sales tax. Auto-numbering, terms/due dates, printable invoices. |
+| **Customers & invoicing** | Invoices with products/services, quantities, per-line taxability and sales tax. Auto-numbering, terms/due dates, PDF output. |
+| **Estimates** | Quotes with an expiry date that never touch the ledger. Accept, decline, or convert one to an invoice. |
+| **Credit memos** | Customer credits for returns, discounts or corrections. They reduce A/R and sales tax and can be applied to any of the customer's invoices. |
+| **Sales receipts** | Sales paid on the spot, deposited straight into a bank account without an invoice. |
+| **Recurring invoices** | Weekly, monthly or yearly templates (month-end aware). Due invoices are created when you ask, all or nothing. |
 | **Vendors & bills** | Enter bills against expense accounts and pay them from any bank or card account. |
 | **Payments** | Apply payments to specific invoices/bills, or let OpenBooks pay the oldest first. Partial payments and overpayment credits both work. |
 | **Banking** | Record expenses, deposits and transfers. Import bank/card CSVs with duplicate detection, then recategorize. |
@@ -65,6 +70,8 @@ statically, so they run with no extra DLLs.
 The desktop app uses the vendored Dear ImGui in `third_party/imgui`, so Windows needs nothing
 extra. On Linux, install GLFW first (e.g. `sudo apt install libglfw3-dev`). On macOS, use
 `brew install glfw`. To build only the CLI and engine, add `-DOPENBOOKS_BUILD_GUI=OFF`.
+For native file dialogs on Linux, have `zenity` (GNOME and most desktops) or `kdialog` (KDE)
+installed. Without either, the app asks for a typed path instead.
 
 ## Quick start
 
@@ -123,6 +130,20 @@ a unique prefix (`Acme` → "Acme Corp"), an account number (`1000`), or `#id`.
 | `amount` | a flat line amount (use it instead of qty/rate) |
 | `account` | the income account (invoices) or expense account (bills) |
 | `taxable` | `yes`/`no` (invoices only) |
+
+### Estimates, credit memos, sales receipts and recurring invoices
+
+```bash
+openbooks estimate create --customer Acme --line "item=Design hour;qty=40" --expires 2026-11-30
+openbooks estimate convert EST-1                      # becomes an invoice
+openbooks credit-memo create --customer Acme --line "desc=Returned goods;amount=120;account=Sales" \n    --apply 1004                                     # or later: credit-memo apply CM-1 --invoice 1004
+openbooks sales-receipt create --customer "Walk-in" --deposit-to Checking --line "item=T-shirt;qty=3"
+openbooks recurring add "Hosting" --customer Acme --frequency monthly --start 2026-01-31 \n    --line "desc=Managed hosting;amount=49;account=Sales"
+openbooks recurring run                               # creates every invoice that is due
+```
+
+Recurring invoices are never created behind your back. The dashboard shows how many are due,
+and one click (or `recurring run`) creates them.
 
 ### PDF invoices
 
@@ -206,8 +227,9 @@ books in place. It applies each change to a copy, saves that copy, and only then
 ## Roadmap
 
 - [x] Desktop GUI
-- [ ] Native file dialogs on Linux/macOS (currently typed paths)
-- [ ] Estimates, credit memos, sales receipts, recurring invoices
+- [x] Native file dialogs on Linux/macOS
+- [x] Estimates, credit memos, sales receipts, recurring invoices
+- [ ] Customer refunds of unapplied credit; per-document-type PDF footers
 - [x] PDF invoices and bills
 - [ ] Company logo on PDFs; email delivery (would need an explicit, opt-in network design)
 - [ ] Inventory quantity tracking and COGS
