@@ -13,9 +13,15 @@ talks to the network.** Your books stay in one local file that you control.
   compiler, CMake and the files in this repository. On Linux/macOS the desktop app also
   needs the system GLFW package.
 - **No URL launching.** Dear ImGui is compiled with `IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS`,
-  which removes its built-in "open link" handler. OpenBooks' only shell call opens a local
-  PDF it has just written (Windows "Preview PDF"). It refuses anything that is not an
-  existing local file, so it can't open URLs.
+  which removes its built-in "open link" handler. OpenBooks only opens a local PDF it has
+  just written ("Preview PDF"). It refuses anything that is not an existing local file given
+  as an absolute path, so it can't open URLs or be mistaken for a command-line option.
+- **No shell.** On Linux and macOS, file dialogs and "Preview PDF" run the desktop's own
+  helpers (`zenity`/`kdialog`, `osascript`, `xdg-open`/`open`) through `posix_spawnp` with an
+  explicit argument list. No command string is built and no shell is involved, so titles and
+  file names (which can contain customer names) can't be interpreted as commands. This is
+  tested with hostile names such as `$(touch …)` and `; rm -rf ~`. The helpers are looked up
+  in `PATH`, the same trust boundary as launching any other desktop program.
 
 ## PDF output
 
