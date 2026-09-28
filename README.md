@@ -241,8 +241,8 @@ books in place. It applies each change to a copy, saves that copy, and only then
 
 ## Contributing
 
-Contributions are welcome. Please add tests in `tests/test_main.cpp` for any change to accounting
-behavior. The rule to keep: **the Balance Sheet must always balance, and money is never a `double`.**
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first. The short version:
+**the Balance Sheet must always balance, money is never a `double`, and nothing talks to the network.**
 
 ## License
 
