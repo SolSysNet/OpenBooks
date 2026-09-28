@@ -1,10 +1,13 @@
 #include "openbooks/cli.hpp"
 
 #include "openbooks/book.hpp"
+#include "openbooks/crypto.hpp"
 #include "openbooks/import.hpp"
 #include "openbooks/invoice_pdf.hpp"
 #include "openbooks/reports.hpp"
 #include "openbooks/util.hpp"
+
+#include "console.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -23,7 +26,7 @@ namespace {
 // ------------------------------------------------------------- arguments
 
 // Options that never take a value.
-const std::set<std::string> kFlags = {"csv", "open", "all", "finish", "empty", "no-header", "negate", "non-taxable", "force",
+const std::set<std::string> kFlags = {"csv", "open", "all", "finish", "empty", "no-header", "negate", "non-taxable", "force", "password",
                                       "help"};
 
 class Args {
@@ -111,16 +114,71 @@ struct Context {
     std::istream& in;
     std::optional<Book> book;
     bool dirty = false;
+    std::unique_ptr<FileKey> key;  // set once an encrypted file has been unlocked
 
-    Book& books() {
-        if (!book) book = Book::load(path);
-        return *book;
-    }
+    Book& books();
     Book& modify() {
         dirty = true;
         return books();
     }
 };
+
+// Asks for a password: hidden on an interactive console, otherwise one line from the input
+// stream (pipes, scripts, tests).
+std::string askPassword(Context& c, const std::string& prompt) {
+    c.err << prompt << std::flush;
+    std::string password;
+    if (&c.in == &std::cin && readHiddenConsoleLine(password)) {
+        c.err << '\n';
+        return password;
+    }
+    if (!std::getline(c.in, password)) throw Error("no password was entered");
+    if (!password.empty() && password.back() == '\r') password.pop_back();
+    // Windows PowerShell prefixes piped input with a UTF-8 byte-order mark.
+    if (startsWith(password, "\xEF\xBB\xBF")) password.erase(0, 3);
+    return password;
+}
+
+Book& Context::books() {
+    if (book) return *book;
+    if (key) {
+        book = Book::loadWithKey(path, *key);  // already unlocked earlier in this session
+    } else if (Book::isEncryptedFile(path)) {
+        // OPENBOOKS_PASSWORD is for scripts; it is visible to other programs run by the same user.
+        const char* env = std::getenv("OPENBOOKS_PASSWORD");
+        std::string password = env && *env ? env : askPassword(*this, "Password for " + path + ": ");
+        try {
+            book = Book::load(path, password, &key);
+        } catch (...) {
+            crypto::wipe(password);
+            throw;
+        }
+        crypto::wipe(password);
+    } else {
+        book = Book::load(path);
+    }
+    return *book;
+}
+
+// Asks for a new password twice.
+std::unique_ptr<FileKey> askNewPassword(Context& c) {
+    std::string first = askPassword(c, "New password (at least " + std::to_string(crypto::kMinPasswordLength) + " characters): ");
+    std::string second = askPassword(c, "Repeat the new password: ");
+    const bool same = first == second;
+    crypto::wipe(second);
+    if (!same) {
+        crypto::wipe(first);
+        throw Error("the passwords don't match");
+    }
+    try {
+        auto key = FileKey::fromNewPassword(first);
+        crypto::wipe(first);
+        return key;
+    } catch (...) {
+        crypto::wipe(first);
+        throw;
+    }
+}
 
 // ---------------------------------------------------------------- parsing
 
@@ -244,17 +302,49 @@ const char* partyNoun(ContactKind k) { return k == ContactKind::Customer ? "cust
 void cmdInit(Context& c, Args& a) {
     const auto name = a.get("company");
     const bool empty = a.flag("empty");
+    const bool protect = a.flag("password");
     a.finish();
     if (std::filesystem::exists(std::filesystem::u8path(c.path)))
         throw Error("'" + c.path + "' already exists; refusing to overwrite it");
+    if (protect) c.key = askNewPassword(c);
     Book b;
     if (name) b.company.name = *name;
     if (!empty) b.createDefaultChart();
     c.book = std::move(b);
     c.dirty = true;
-    c.out << "Created new books for " << c.book->company.name << " in '" << c.path << "'";
+    c.out << "Created new " << (protect ? "password-protected " : "") << "books for " << c.book->company.name
+          << " in '" << c.path << "'";
     if (!empty) c.out << " with " << c.book->accounts().size() << " starter accounts";
     c.out << ".\n";
+}
+
+void cmdPassword(Context& c, Args& a) {
+    const std::string sub = a.positional(0, "subcommand (status, set, remove)");
+    a.finish();
+    if (sub == "status") {
+        if (!Book::isEncryptedFile(c.path)) {
+            c.out << "'" << c.path << "' is not password protected.\n";
+            return;
+        }
+        c.books();  // unlock, to report the actual settings
+        c.out << "'" << c.path << "' is password protected: AES-256-GCM, key from PBKDF2-HMAC-SHA256 with "
+              << c.key->iterations() << " iterations (" << crypto::backendName() << ").\n";
+    } else if (sub == "set") {
+        c.books();  // asks for the current password first if there is one
+        const bool changing = c.key != nullptr;
+        c.key = askNewPassword(c);
+        c.dirty = true;
+        c.out << (changing ? "Password changed" : "Password set") << " for '" << c.path << "'.\n"
+              << "Keep it safe: without it these books can't be recovered by anyone.\n";
+    } else if (sub == "remove") {
+        c.books();
+        if (!c.key) throw Error("'" + c.path + "' is not password protected");
+        c.key.reset();
+        c.dirty = true;
+        c.out << "Password removed: '" << c.path << "' is now stored unencrypted.\n";
+    } else {
+        throw Error("unknown password subcommand '" + sub + "'");
+    }
 }
 
 void cmdCompany(Context& c, Args& a) {
@@ -1064,7 +1154,17 @@ void runShell(Context& c);
 const std::vector<Command>& commands() {
     using CK = ContactKind;
     static const std::vector<Command> list = {
-        {"init", "  openbooks init [--company NAME] [--empty]", "Create a new books file (starter chart of accounts unless --empty)", cmdInit},
+        {"init", "  openbooks init [--company NAME] [--empty] [--password]\n"
+                 "  --password asks for a password and creates the file encrypted.",
+         "Create a new books file (starter chart of accounts unless --empty)", cmdInit},
+        {"password",
+         "  openbooks password status\n"
+         "  openbooks password set       (add a password, or change it)\n"
+         "  openbooks password remove    (store the file unencrypted again)\n"
+         "  Encrypted files ask for their password when opened. For scripts, set OPENBOOKS_PASSWORD\n"
+         "  (note: other programs you run can read environment variables). There is no recovery:\n"
+         "  a forgotten password means the books can't be opened.",
+         "Protect the books file with a password (AES-256-GCM)", cmdPassword},
         {"company",
          "  openbooks company [show]\n"
          "  openbooks company set [--name N] [--address A] [--email E] [--phone P] [--invoice-footer TEXT]\n"
@@ -1249,7 +1349,7 @@ int execute(Context& c, const std::vector<std::string>& tokens) {
     try {
         dispatch(c, tokens);
         if (c.dirty && c.book) {
-            c.book->save(c.path);
+            c.book->save(c.path, c.key.get());
             c.dirty = false;
         }
         return 0;
@@ -1337,7 +1437,7 @@ int runCli(const std::vector<std::string>& args, std::ostream& out, std::ostream
         }
     }
     if (path.empty()) path = "books.obk";
-    Context c{path, out, err, in, std::nullopt, false};
+    Context c{path, out, err, in, std::nullopt, false, nullptr};
     return execute(c, std::vector<std::string>(args.begin() + static_cast<std::ptrdiff_t>(i), args.end()));
 }
 

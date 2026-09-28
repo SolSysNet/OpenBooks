@@ -52,10 +52,14 @@ Open a file with `openbooks-gui path\to\books.obk`, or use File → Open.
 | **Reports** | Balance Sheet (with retained-earnings rollover by fiscal year), Profit & Loss, Trial Balance, A/R and A/P Aging, Journal, account registers. Every report can be printed as text or exported as `--csv`. |
 | **Controls** | You can void but never delete, so the audit trail is kept. Closing the books locks a period. A/R and A/P change only through invoices, bills and payments, so the sub-ledgers always agree with the general ledger. |
 | **Safe storage** | Saves are atomic (write, then rename), a `.bak` of the previous save is kept, and integrity is checked on every load. |
+| **Password protection** | Optional encryption of the books file (AES-256-GCM, key from PBKDF2-HMAC-SHA256), using Windows CNG or the system's OpenSSL. No homemade crypto. |
 
 ## Building
 
-You need CMake 3.16+ and a C++17 compiler (GCC 9+, Clang 10+, or MSVC 2019+).
+You need CMake 3.16+ and a C++17 compiler (GCC 9+, Clang 10+, or MSVC 2019+). On Linux and macOS,
+OpenSSL's libcrypto (1.1.1+) must already be installed: `sudo apt install libssl-dev`,
+`sudo dnf install openssl-devel`, or `brew install openssl` with
+`-DOPENSSL_ROOT_DIR=$(brew --prefix openssl)`. Windows uses its built-in CNG instead.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -144,6 +148,20 @@ openbooks recurring run                               # creates every invoice th
 
 Recurring invoices are never created behind your back. The dashboard shows how many are due,
 and one click (or `recurring run`) creates them.
+
+### Password protection
+
+```bash
+openbooks init --company "Blue Door Design" --password   # new encrypted books
+openbooks password set        # add a password to existing books (or change it)
+openbooks password status
+openbooks password remove     # store unencrypted again
+```
+
+Encrypted books ask for their password when opened. In the desktop app it's the
+**Password protected** option when creating a company, or **Company Settings → Security**.
+**There is no recovery for a forgotten password.** See [SECURITY.md](SECURITY.md) for exactly
+what is and isn't protected.
 
 ### PDF invoices
 

@@ -10,8 +10,8 @@ talks to the network.** Your books stay in one local file that you control.
   planned without a separate, opt-in design review.
 - **No build-time downloads.** CMake never fetches anything (`FetchContent`,
   `ExternalProject` and package managers are not used). A build needs only a C++17
-  compiler, CMake and the files in this repository. On Linux/macOS the desktop app also
-  needs the system GLFW package.
+  compiler, CMake and the files in this repository. On Linux/macOS, the system's OpenSSL
+  (for file encryption) and, for the desktop app, GLFW must already be installed.
 - **No URL launching.** Dear ImGui is compiled with `IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS`,
   which removes its built-in "open link" handler. OpenBooks only opens a local PDF it has
   just written ("Preview PDF"). It refuses anything that is not an existing local file given
@@ -40,14 +40,40 @@ no third-party code and no API for anything but text, lines and rectangles:
 
 ## Data at rest
 
-- Books are a plain UTF-8 text file (`.obk`). Saves write a temporary file and rename it
-  over the original, keeping the previous version as `.obk.bak`. Every load is checked:
-  each transaction must balance and reference real accounts.
-- The file is **not encrypted**. Store it on an encrypted disk (BitLocker, FileVault,
-  LUKS) or in an encrypted container if the device could be lost or shared.
-- The desktop app keeps only UI preferences and a recent-files list in
-  `%APPDATA%\OpenBooks` (Windows) or `~/.config/openbooks` (Linux) or
-  `~/Library/Application Support/OpenBooks` (macOS).
+- Books are a UTF-8 text file (`.obk`). Saves write a temporary file and rename it over the
+  original, keeping the previous version as `.obk.bak`. Every load is checked: each
+  transaction must balance and reference real accounts.
+- **Password protection (optional).** `openbooks password set`, or the option in the desktop
+  app, encrypts the whole file:
+  - The key is derived with **PBKDF2-HMAC-SHA256** (600,000 iterations, 16-byte random salt).
+  - The file is encrypted with **AES-256-GCM** (fresh 12-byte random nonce on every save).
+    The header, including the iteration count, is authenticated, so any tampering or
+    corruption is detected.
+  - The format is documented in `include/openbooks/crypto.hpp`.
+  - OpenBooks implements none of the cryptography itself. It comes from **Windows CNG** on
+    Windows and the system's **OpenSSL libcrypto** on Linux and macOS (a hard build
+    requirement there, never downloaded). Both backends are checked against published test
+    vectors (RFC 7914 PBKDF2, McGrew–Viega AES-GCM), so files move freely between platforms.
+- **What encryption protects:**
+  - The temporary file and the `.bak` are encrypted too, so plaintext never reaches disk
+    during a save. When a password is first added, any old unencrypted `.bak` is deleted.
+  - Older unencrypted copies can still exist elsewhere: backups, cloud-sync history, or
+    freed disk space. Encrypting the file doesn't reach those. Use full-disk encryption
+    (BitLocker, FileVault, LUKS) as well.
+  - While books are open, they and the key are in memory. The key is wiped when the books
+    are closed, and passwords are wiped after use. This is best effort: memory the OS or
+    the UI library copies can't be fully controlled.
+  - "Preview PDF" writes an unencrypted PDF to a private temp folder. The app deletes these
+    when the books are closed and when it exits. Files you export (PDF, CSV) are not
+    encrypted.
+- **There is no password recovery.** A forgotten password means the books can't be
+  opened by anyone.
+- **Scripts** can supply the password in `OPENBOOKS_PASSWORD`. Environment variables can be
+  read by other programs running as the same user, so prefer the interactive prompt, which
+  doesn't echo what you type.
+- The desktop app keeps only UI preferences and a recent-files list (file paths, no financial
+  data) in `%APPDATA%\OpenBooks` (Windows), `~/.config/openbooks` (Linux) or
+  `~/Library/Application Support/OpenBooks` (macOS). This config is not encrypted.
 
 ## Third-party code
 

@@ -4,6 +4,7 @@
 
 #include <iosfwd>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -11,6 +12,8 @@
 #include <vector>
 
 namespace ob {
+
+class FileKey;  // crypto.hpp
 
 // Every validation failure in the ledger is reported as an ob::Error with a user-facing message.
 class Error : public std::runtime_error {
@@ -131,8 +134,16 @@ public:
     // ---- Persistence (storage.cpp). Paths are UTF-8.
     void write(std::ostream& out) const;
     static Book read(std::istream& in);
-    void save(const std::string& path) const;  // atomic replace, keeps a .bak of the previous file
-    static Book load(const std::string& path);
+    // Atomic replace, keeping a .bak of the previous file. With a key the file is encrypted
+    // (see crypto.hpp); the temporary file is encrypted too, so plaintext never touches disk.
+    void save(const std::string& path, const FileKey* key = nullptr) const;
+    // Encrypted files need the password: without one this throws PasswordRequiredError, with a
+    // wrong one WrongPasswordError. `keyOut` receives the key for later saves.
+    static Book load(const std::string& path, std::string_view password = {},
+                     std::unique_ptr<FileKey>* keyOut = nullptr);
+    // Reopens a file with a key obtained from an earlier load (no password prompt needed).
+    static Book loadWithKey(const std::string& path, const FileKey& key);
+    static bool isEncryptedFile(const std::string& path);
 
 private:
     Account& accountMut(int id);

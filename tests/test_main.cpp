@@ -2,14 +2,17 @@
 
 #include "openbooks/book.hpp"
 #include "openbooks/cli.hpp"
+#include "openbooks/crypto.hpp"
 #include "openbooks/invoice_pdf.hpp"
 #include "openbooks/pdf.hpp"
 #include "openbooks/reports.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -691,6 +694,156 @@ TEST(company_fields_round_trip_and_old_files_load) {
     CHECK(legacy.company.paperSize == PaperSize::Letter);
 }
 
+// ------------------------------------------------------------- encryption
+
+std::string hex(std::string_view bytes) {
+    static const char* digits = "0123456789abcdef";
+    std::string out;
+    for (char ch : bytes) {
+        const auto c = static_cast<unsigned char>(ch);
+        out += digits[c >> 4];
+        out += digits[c & 15];
+    }
+    return out;
+}
+
+std::string unhex(std::string_view text) {
+    std::string out;
+    for (std::size_t i = 0; i + 1 < text.size(); i += 2) out += static_cast<char>(std::stoi(std::string(text.substr(i, 2)), nullptr, 16));
+    return out;
+}
+
+TEST(crypto_pbkdf2_known_answers) {
+    unsigned char out[32];
+    // RFC 7914 section 11 (first 32 bytes of the 64-byte result).
+    crypto::pbkdf2Sha256("passwd", reinterpret_cast<const unsigned char*>("salt"), 4, 1, out, 32);
+    CHECK_EQ(hex(std::string_view(reinterpret_cast<char*>(out), 32)),
+             std::string("55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"));
+    // Real-world settings, cross-checked against Python's hashlib (backed by OpenSSL).
+    unsigned char salt[16];
+    for (int i = 0; i < 16; ++i) salt[i] = static_cast<unsigned char>(i);
+    crypto::pbkdf2Sha256("correct horse battery staple", salt, 16, 600000, out, 32);
+    CHECK_EQ(hex(std::string_view(reinterpret_cast<char*>(out), 32)),
+             std::string("ef177144eec9420cbc1093d2a8b344a92bc506d0d4ec9c028dd19f8324d8c1e6"));
+}
+
+TEST(crypto_aes_gcm_known_answers) {
+    // McGrew & Viega, "The Galois/Counter Mode of Operation", test cases 13, 14 and 16.
+    const std::string zeroKey(32, '\0');
+    const std::string zeroNonce(12, '\0');
+    auto key = [](const std::string& k) { return reinterpret_cast<const unsigned char*>(k.data()); };
+    CHECK_EQ(hex(crypto::aes256GcmEncrypt(key(zeroKey), key(zeroNonce), "", "")),
+             std::string("530f8afbc74536b9a963b4f1c4cb738b"));
+    CHECK_EQ(hex(crypto::aes256GcmEncrypt(key(zeroKey), key(zeroNonce), "", std::string(16, '\0'))),
+             std::string("cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919"));
+
+    const std::string k16 = unhex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308");
+    const std::string n16 = unhex("cafebabefacedbaddecaf888");
+    const std::string p16 = unhex(
+        "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657"
+        "ba637b39");
+    const std::string a16 = unhex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+    const std::string sealed = crypto::aes256GcmEncrypt(key(k16), key(n16), a16, p16);
+    CHECK_EQ(hex(sealed.substr(sealed.size() - 16)), std::string("76fc6ece0f4e1768cddf8853bb2d551b"));
+    const auto opened = crypto::aes256GcmDecrypt(key(k16), key(n16), a16, sealed);
+    CHECK(opened && *opened == p16);
+    CHECK(!crypto::aes256GcmDecrypt(key(k16), key(n16), "other aad", sealed));
+}
+
+TEST(file_key_round_trip_and_tamper_detection) {
+    const std::string text = "OPENBOOKS\t2\nCOMPANY\tSecret Co\n";
+    auto key = FileKey::fromNewPassword("a long passphrase", crypto::kMinIterations);
+    const std::string file = key->encryptFile(text);
+    CHECK(FileKey::isEncrypted(file));
+    CHECK(file.find("Secret") == std::string::npos);
+    CHECK(file != key->encryptFile(text));  // fresh nonce every time
+    CHECK(key->matches("a long passphrase"));
+    CHECK(!key->matches("a long passphrasE"));
+
+    std::unique_ptr<FileKey> reopened;
+    CHECK_EQ(FileKey::decryptFile(file, "a long passphrase", &reopened), text);
+    CHECK(reopened && reopened->matches("a long passphrase"));
+    // The reopened key encrypts files the original password still opens.
+    CHECK_EQ(FileKey::decryptFile(reopened->encryptFile("x"), "a long passphrase"), std::string("x"));
+
+    bool wrongPassword = false;
+    try {
+        FileKey::decryptFile(file, "not the password");
+    } catch (const WrongPasswordError&) {
+        wrongPassword = true;
+    }
+    CHECK(wrongPassword);
+
+    // Flipping any byte - header (iterations, salt, nonce), ciphertext or tag - is detected.
+    int detected = 0;
+    const std::size_t positions[] = {10, 14, 31, crypto::kHeaderSize, file.size() - 1};
+    for (std::size_t pos : positions) {
+        std::string bad = file;
+        bad[pos] = static_cast<char>(bad[pos] ^ 0x01);
+        try {
+            FileKey::decryptFile(bad, "a long passphrase");
+        } catch (const Error&) {
+            ++detected;
+        }
+    }
+    CHECK_EQ(detected, 5);
+    CHECK_THROWS(FileKey::decryptFile(file.substr(0, 30), "a long passphrase"));  // truncated
+    CHECK_THROWS(FileKey::fromNewPassword("short"));                              // too short
+
+    // A crafted header asking for billions of iterations is refused, not ground through.
+    std::string greedy = file;
+    greedy[10] = greedy[11] = greedy[12] = greedy[13] = '\xff';
+    CHECK_THROWS(FileKey::decryptFile(greedy, "a long passphrase"));
+}
+
+TEST(encrypted_books_on_disk) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "openbooks-crypto-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string path = (dir / "books.obk").string();
+
+    Fixture f;
+    f.b.company.name = "Very Private LLC";
+    f.invoice("2026-01-05", M("123.45"));
+    f.b.save(path);  // plaintext first, which also leaves a plaintext .bak on the next save
+    f.b.save(path);
+    CHECK(fs::exists(path + ".bak"));
+
+    auto key = FileKey::fromNewPassword("hunter2hunter2", crypto::kMinIterations);
+    f.b.save(path, key.get());
+    CHECK(Book::isEncryptedFile(path));
+    CHECK(!fs::exists(path + ".bak"));  // the old plaintext backup is gone
+    CHECK(!fs::exists(path + ".tmp"));
+    std::ifstream raw(path, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(raw)), std::istreambuf_iterator<char>());
+    raw.close();
+    CHECK(bytes.find("Very Private") == std::string::npos);
+    CHECK(bytes.find("123.45") == std::string::npos);
+
+    bool required = false;
+    try {
+        Book::load(path);
+    } catch (const PasswordRequiredError&) {
+        required = true;
+    }
+    CHECK(required);
+    CHECK_THROWS(Book::load(path, "wrong password!"));
+    std::unique_ptr<FileKey> loadedKey;
+    const Book loaded = Book::load(path, "hunter2hunter2", &loadedKey);
+    CHECK_EQ(loaded.company.name, std::string("Very Private LLC"));
+    CHECK_EQ(loaded.balance(f.ar), M("123.45"));
+
+    // Saving again keeps it encrypted, and the backup is now the encrypted previous version.
+    loaded.save(path, loadedKey.get());
+    CHECK(Book::isEncryptedFile(path) && Book::isEncryptedFile(path + ".bak"));
+    // Removing the password.
+    loaded.save(path);
+    CHECK(!Book::isEncryptedFile(path));
+    CHECK_EQ(Book::load(path).company.name, std::string("Very Private LLC"));
+    fs::remove_all(dir);
+}
+
 // ------------------------------------------------ estimates, credits, receipts
 
 Document salesDoc(const Fixture& f, DocKind kind, const char* date, Money rate, Decimal taxRate = Decimal()) {
@@ -1046,6 +1199,27 @@ TEST(cli_end_to_end) {
     CHECK(cli(file, {"recurring", "list"}).out.find("Finished") != std::string::npos);
     r = cli(file, {"report", "balance-sheet", "--as-of", "2025-12-31"});
     CHECK(r.out.find("WARNING") == std::string::npos);
+
+    // Password protection: set, reopen with the password, wrong password, remove.
+    // (The byte-order mark is what Windows PowerShell puts in front of piped input.)
+    r = cli(file, {"password", "set"}, "\xEF\xBB\xBFtrustno1trustno1\r\ntrustno1trustno1\r\n");
+    CHECK_EQ(r.code, 0);
+    CHECK(Book::isEncryptedFile(file));
+    CHECK_EQ(cli(file, {"password", "set"}, "trustno1trustno1\nmismatch1\nmismatch2\n").code, 1);  // repeat differs
+    r = cli(file, {"report", "trial-balance"}, "trustno1trustno1\n");
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.find("Total") != std::string::npos);
+    r = cli(file, {"report", "trial-balance"}, "not it at all\n");
+    CHECK_EQ(r.code, 1);
+    CHECK(r.err.find("wrong password") != std::string::npos);
+    CHECK(cli(file, {"password", "status"}, "trustno1trustno1\n").out.find("AES-256-GCM") != std::string::npos);
+    // In the shell the password is asked once, then reused, even after a failing command.
+    r = cli(file, {"shell"}, "journal --debit Checking=1 --credit Sales=2\ntrustno1trustno1\ncustomers\nexit\n");
+    CHECK(r.err.find("out of balance") != std::string::npos);
+    CHECK(r.out.find("Acme Corp") != std::string::npos);
+    CHECK(r.err.find("Password for") == r.err.rfind("Password for"));  // asked exactly once
+    CHECK_EQ(cli(file, {"password", "remove"}, "trustno1trustno1\n").code, 0);
+    CHECK(!Book::isEncryptedFile(file));
 
     // PDF export refuses to overwrite unless forced.
     const std::string pdfPath = (dir / "inv.pdf").string();

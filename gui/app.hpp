@@ -8,6 +8,7 @@
 // references into the Book; it remembers ids.
 
 #include "openbooks/book.hpp"
+#include "openbooks/crypto.hpp"
 #include "openbooks/reports.hpp"
 
 #include <chrono>
@@ -241,6 +242,24 @@ struct NewCompanyForm {
     std::string name;
     std::string path;
     bool starterChart = true;
+    bool protect = false;  // create the file encrypted
+    std::string password;
+    std::string repeat;
+    std::string error;
+};
+
+// Unlocking an encrypted file, and setting / changing / removing its password.
+struct UnlockState {
+    std::string path;
+    std::string password;
+    std::string error;
+};
+
+struct PasswordForm {
+    int mode = 0;  // 0 set, 1 change, 2 remove
+    std::string current;
+    std::string next;
+    std::string repeat;
     std::string error;
 };
 
@@ -274,7 +293,7 @@ public:
 
 private:
     // ---- books & persistence
-    bool openBooks(std::string path);
+    bool openBooks(std::string path, std::string password = {});
     void closeBooks();
     bool commit(const std::function<void(ob::Book&)>& change, std::string* error = nullptr,
                 const std::string& success = {});
@@ -310,6 +329,10 @@ private:
     void openDocument(int documentId);  // navigate to its list and select it
     void openApplyCredit(int contactId, int creditMemoId, int invoiceId);
     void drawApplyCreditModal();
+    void drawUnlockModal();
+    void drawPasswordModal();
+    void openPasswordForm(int mode);
+    void clearPreviews();
     void drawRecurring();
     void createDueRecurring();
     void drawPaymentForm(ob::PaymentKind kind);
@@ -339,6 +362,10 @@ private:
 
     // ---- state
     std::optional<ob::Book> book_;
+    std::unique_ptr<ob::FileKey> key_;  // set while an encrypted file is open
+    std::string lastOpenError_;
+    UnlockState unlock_;
+    PasswordForm passwordForm_;
     std::string path_;
     std::uint64_t version_ = 1;
     Derived derived_;

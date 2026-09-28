@@ -7,6 +7,7 @@
 // without OpenBooks itself.
 
 #include "openbooks/book.hpp"
+#include "openbooks/crypto.hpp"
 #include "openbooks/util.hpp"
 
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <istream>
 #include <ostream>
 #include <set>
+#include <sstream>
 
 namespace ob {
 namespace {
@@ -430,15 +432,39 @@ Book Book::read(std::istream& in) {
     return b;
 }
 
-void Book::save(const std::string& path) const {
+namespace {
+
+std::string readFileBytes(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    return buffer.str();
+}
+
+bool fileIsEncrypted(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    char magic[8] = {};
+    in.read(magic, sizeof magic);
+    return in.gcount() == sizeof magic && FileKey::isEncrypted(std::string_view(magic, sizeof magic));
+}
+
+}  // namespace
+
+void Book::save(const std::string& path, const FileKey* key) const {
     namespace fs = std::filesystem;
     const fs::path target = fs::u8path(path);
     fs::path tmp = target;
     tmp += ".tmp";
     {
+        std::ostringstream text;
+        write(text);
+        std::string plaintext = text.str();
+        std::string bytes = key ? key->encryptFile(plaintext) : plaintext;
+        if (key) crypto::wipe(plaintext);
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out) throw Error("cannot write '" + tmp.u8string() + "'");
-        write(out);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         out.flush();
         if (!out) throw Error("failed while writing '" + tmp.u8string() + "'");
     }
@@ -446,7 +472,12 @@ void Book::save(const std::string& path) const {
     if (fs::exists(target, ec)) {
         fs::path backup = target;
         backup += ".bak";
-        fs::copy_file(target, backup, fs::copy_options::overwrite_existing, ec);
+        if (key && !fileIsEncrypted(target)) {
+            // Adding a password: never keep an unencrypted backup next to the encrypted file.
+            fs::remove(backup, ec);
+        } else {
+            fs::copy_file(target, backup, fs::copy_options::overwrite_existing, ec);
+        }
     }
     ec.clear();
     fs::rename(tmp, target, ec);
@@ -459,10 +490,35 @@ void Book::save(const std::string& path) const {
     }
 }
 
-Book Book::load(const std::string& path) {
-    std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
-    if (!in) throw Error("cannot open '" + path + "' (create new books with: openbooks init)");
-    return read(in);
+Book Book::load(const std::string& path, std::string_view password, std::unique_ptr<FileKey>* keyOut) {
+    const std::filesystem::path file = std::filesystem::u8path(path);
+    {
+        std::ifstream probe(file, std::ios::binary);
+        if (!probe) throw Error("cannot open '" + path + "' (create new books with: openbooks init)");
+    }
+    if (!fileIsEncrypted(file)) {
+        std::ifstream in(file, std::ios::binary);
+        if (keyOut) keyOut->reset();
+        return read(in);
+    }
+    if (password.empty()) throw PasswordRequiredError("'" + path + "' is password protected");
+    std::string plaintext = FileKey::decryptFile(readFileBytes(file), password, keyOut);
+    std::istringstream in(plaintext);
+    Book book = read(in);
+    crypto::wipe(plaintext);
+    return book;
 }
+
+Book Book::loadWithKey(const std::string& path, const FileKey& key) {
+    const std::filesystem::path file = std::filesystem::u8path(path);
+    if (!fileIsEncrypted(file)) return load(path);
+    std::string plaintext = key.decryptFile(readFileBytes(file));
+    std::istringstream in(plaintext);
+    Book book = read(in);
+    crypto::wipe(plaintext);
+    return book;
+}
+
+bool Book::isEncryptedFile(const std::string& path) { return fileIsEncrypted(std::filesystem::u8path(path)); }
 
 }  // namespace ob

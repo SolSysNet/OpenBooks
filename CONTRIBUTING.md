@@ -28,6 +28,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+- On Linux and macOS, OpenSSL's libcrypto must be installed (`libssl-dev`, `openssl-devel` or
+  `brew install openssl@3`). It provides the file encryption; Windows uses its built-in CNG.
 - The desktop app builds by default. On Linux install GLFW (`libglfw3-dev`); on macOS use
   `brew install glfw`. Use `-DOPENBOOKS_BUILD_GUI=OFF` to build only the engine and CLI.
 - Do GUI work in a **Debug** build: Dear ImGui's assertions catch real layout bugs there that a
@@ -69,7 +71,9 @@ See the README's *Project layout* section for a map of the code.
   must only change through documents and payments.
 - **The engine has no UI.** `openbooks_core` must not depend on the CLI or GUI. Anything both need
   (like CSV import or PDF output) belongs in the core.
-- **Keep dependencies at zero.** The engine uses only the C++17 standard library.
+- **Keep dependencies minimal.** The engine uses only the C++17 standard library, plus the
+  platform crypto provider for file encryption (CNG on Windows, OpenSSL elsewhere; see
+  `src/crypto_*.cpp`). Never implement cryptography yourself; use those primitives.
 
 ### Changing the file format
 

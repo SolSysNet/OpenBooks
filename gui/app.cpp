@@ -105,7 +105,10 @@ App::App(std::string initialPath) {
     }
 }
 
-App::~App() { saveConfig(); }
+App::~App() {
+    saveConfig();
+    clearPreviews();
+}
 
 void App::loadConfig() {
     std::ifstream in(pathFromUtf8(configPath_));
@@ -152,11 +155,28 @@ void App::rememberRecent(std::string path) {  // by value: `path` may alias an e
     saveConfig();
 }
 
-bool App::openBooks(std::string path) {  // by value, see rememberRecent()
+bool App::openBooks(std::string path, std::string password) {  // by value, see rememberRecent()
+    lastOpenError_.clear();
+    std::unique_ptr<FileKey> key;
     try {
-        Book loaded = Book::load(path);
+        if (password.empty() && Book::isEncryptedFile(path)) {
+            // Ask for the password; the unlock dialog calls back in here with it.
+            unlock_ = UnlockState{};
+            unlock_.path = path;
+            requestPopup("Unlock Books");
+            return false;
+        }
+        Book loaded = Book::load(path, password, &key);
+        crypto::wipe(password);
         book_ = std::move(loaded);
+        key_ = std::move(key);  // null for unencrypted files
+    } catch (const WrongPasswordError& e) {
+        crypto::wipe(password);
+        lastOpenError_ = e.what();  // shown inside the unlock dialog
+        return false;
     } catch (const std::exception& e) {
+        crypto::wipe(password);
+        lastOpenError_ = e.what();
         notify(std::string("Could not open books: ") + e.what(), true);
         return false;
     }
@@ -186,8 +206,20 @@ bool App::openBooks(std::string path) {  // by value, see rememberRecent()
 
 void App::closeBooks() {
     book_.reset();
+    key_.reset();  // wipes the key
     path_.clear();
+    clearPreviews();
     ++version_;
+}
+
+// "Preview PDF" writes unencrypted copies to a temp folder; remove them when they're done with.
+void App::clearPreviews() {
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "OpenBooks";
+    if (ec || !fs::is_directory(dir, ec)) return;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (entry.path().extension() == ".pdf") fs::remove(entry.path(), ec);
+    }
 }
 
 bool App::commit(const std::function<void(Book&)>& change, std::string* error, const std::string& success) {
@@ -195,7 +227,7 @@ bool App::commit(const std::function<void(Book&)>& change, std::string* error, c
     try {
         Book draft = *book_;
         change(draft);
-        draft.save(path_);
+        draft.save(path_, key_.get());  // encrypted again when the file has a password
         *book_ = std::move(draft);
         ++version_;
         if (error) error->clear();
@@ -483,6 +515,10 @@ void App::drawStatusBar() {
     ImGui::SetCursorPosX(10.0f);
     ImGui::AlignTextToFramePadding();
     ui::Muted(path_.c_str());
+    if (key_) {
+        ImGui::SameLine();
+        ui::Badge("Password protected", colorPositive());
+    }
     if (notice_.empty()) return;
     const float age = std::chrono::duration<float>(std::chrono::steady_clock::now() - noticeTime_).count();
     if (age > kNoticeSeconds) return;
@@ -532,6 +568,20 @@ void App::drawWelcome() {
     ImGui::SetCursorPosX(labelColumn);
     ImGui::Checkbox("Start with a standard chart of accounts", &newCompany_.starterChart);
     ImGui::SetCursorPosX(labelColumn);
+    ImGui::Checkbox("Protect with a password (encrypted with AES-256)", &newCompany_.protect);
+    if (newCompany_.protect) {
+        ui::FormLabel("Password", labelColumn);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+        ui::InputString("##newpw", newCompany_.password, ImGuiInputTextFlags_Password);
+        ui::FormLabel("Repeat password", labelColumn);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+        ui::InputString("##newpw2", newCompany_.repeat, ImGuiInputTextFlags_Password);
+        ImGui::SetCursorPosX(labelColumn);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+        ui::Muted("There is no way to recover a forgotten password. Keep it somewhere safe.");
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::SetCursorPosX(labelColumn);
     if (ui::PrimaryButton("Create Company")) {
         newCompany_.error.clear();
         const std::string name = trim(newCompany_.name);
@@ -540,14 +590,20 @@ void App::drawWelcome() {
         if (name.empty()) newCompany_.error = "Enter a company name.";
         else if (path.empty()) newCompany_.error = "Choose where to save the books.";
         else if (fs::exists(pathFromUtf8(path), ec)) newCompany_.error = "That file already exists. Open it instead, or pick another name.";
+        else if (newCompany_.protect && newCompany_.password != newCompany_.repeat) newCompany_.error = "The passwords don't match.";
         else {
             try {
+                std::unique_ptr<FileKey> key;
+                if (newCompany_.protect) key = FileKey::fromNewPassword(newCompany_.password);
                 Book b;
                 b.company.name = name;
                 if (newCompany_.starterChart) b.createDefaultChart();
                 fs::create_directories(pathFromUtf8(path).parent_path(), ec);
-                b.save(path);
-                if (openBooks(path)) notify("Created " + name);
+                b.save(path, key.get());
+                std::string password = newCompany_.password;
+                crypto::wipe(newCompany_.password);
+                crypto::wipe(newCompany_.repeat);
+                if (openBooks(path, std::move(password))) notify("Created " + name);
             } catch (const std::exception& e) {
                 newCompany_.error = e.what();
             }
@@ -627,6 +683,7 @@ void App::drawModals() {
         ImGui::EndPopup();
     }
 
+    drawUnlockModal();  // needed before any books are open
     if (!book_) return;
     drawContactModal();
     drawAccountModal();
@@ -636,6 +693,7 @@ void App::drawModals() {
     drawRecategorizeModal();
     drawTransactionModal();
     drawApplyCreditModal();
+    drawPasswordModal();
 }
 
 // ------------------------------------------------------------- dashboard

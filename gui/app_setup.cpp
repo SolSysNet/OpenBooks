@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <filesystem>
 
 namespace obgui {
 
@@ -343,6 +344,21 @@ void App::drawCompany() {
     ui::Heading("Company Settings");
     ui::Muted(("Books file: " + path_).c_str());
     ImGui::Dummy(ImVec2(0, 6));
+    ui::SubHeading("Security");
+    if (key_) {
+        ImGui::TextColored(colorPositive(), "This file is password protected.");
+        ui::Muted(("AES-256-GCM, key derived with PBKDF2-HMAC-SHA256 (" + std::to_string(key_->iterations()) +
+                   " iterations) using " + crypto::backendName() + ".")
+                      .c_str());
+        if (ImGui::Button("Change password...")) openPasswordForm(1);
+        ImGui::SameLine();
+        if (ImGui::Button("Remove password...")) openPasswordForm(2);
+    } else {
+        ImGui::TextUnformatted("This file is stored unencrypted.");
+        ui::Muted("Anyone who can read the file can read your books. A password encrypts it with AES-256.");
+        if (ui::PrimaryButton("Set a password...")) openPasswordForm(0);
+    }
+    ImGui::Dummy(ImVec2(0, 6));
     const float col = ImGui::GetFontSize() * 11.0f;
     const float width = ImGui::GetFontSize() * 22.0f;
 
@@ -441,6 +457,124 @@ void App::drawCompany() {
     }
     ImGui::SameLine();
     if (ImGui::Button("Revert")) f.loaded = false;
+}
+
+// ------------------------------------------------------------ passwords
+
+void App::drawUnlockModal() {
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Unlock Books", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    UnlockState& u = unlock_;
+    ui::SubHeading(std::filesystem::u8path(u.path).filename().u8string().c_str());
+    ImGui::TextUnformatted("These books are password protected.");
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+    static bool refocus = false;  // put the cursor back in the field after a failed attempt
+    if (ImGui::IsWindowAppearing() || refocus) ImGui::SetKeyboardFocusHere();
+    refocus = false;
+    const bool enter = ui::InputStringHint("##password", "Password", u.password,
+                                           ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
+    ui::ErrorText(u.error);
+    ImGui::Separator();
+    if (ui::PrimaryButton("Unlock") || enter) {
+        std::string password = u.password;
+        crypto::wipe(u.password);
+        if (password.empty()) {
+            u.error = "Enter the password.";
+        } else if (openBooks(u.path, std::move(password))) {
+            ImGui::CloseCurrentPopup();
+        } else {
+            u.error = lastOpenError_;
+            refocus = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        crypto::wipe(u.password);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void App::openPasswordForm(int mode) {
+    passwordForm_ = PasswordForm{};
+    passwordForm_.mode = mode;
+    requestPopup("Books Password");
+}
+
+void App::drawPasswordModal() {
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Books Password", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    PasswordForm& f = passwordForm_;
+    static const char* kTitles[] = {"Set a password", "Change password", "Remove password"};
+    ui::SubHeading(kTitles[f.mode]);
+    const float col = ImGui::GetFontSize() * 9.0f;
+    const float width = ImGui::GetFontSize() * 16.0f;
+    if (f.mode != 0) {
+        ui::FormLabel("Current password", col);
+        ImGui::SetNextItemWidth(width);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ui::InputString("##current", f.current, ImGuiInputTextFlags_Password);
+    }
+    if (f.mode != 2) {
+        ui::FormLabel("New password", col);
+        ImGui::SetNextItemWidth(width);
+        if (f.mode == 0 && ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ui::InputString("##next", f.next, ImGuiInputTextFlags_Password);
+        ui::FormLabel("Repeat", col);
+        ImGui::SetNextItemWidth(width);
+        ui::InputString("##repeat", f.repeat, ImGuiInputTextFlags_Password);
+        ImGui::SetCursorPosX(col + ImGui::GetStyle().WindowPadding.x);
+        const std::size_t length = f.next.size();
+        if (length == 0) ui::Muted("At least 8 characters. A few random words make a strong password.");
+        else if (length < crypto::kMinPasswordLength) ImGui::TextColored(colorNegative(), "Too short");
+        else if (length < 14) ImGui::TextColored(colorWarning(), "OK - longer is stronger");
+        else ImGui::TextColored(colorPositive(), "Good length");
+    }
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 26.0f);
+    if (f.mode == 2) {
+        ImGui::TextUnformatted("The file will be stored unencrypted. Anyone who can read it can read your books.");
+    } else {
+        ImGui::TextColored(colorWarning(), "There is no recovery. If you forget this password, nobody - including "
+                                           "the OpenBooks developers - can open these books.");
+    }
+    ImGui::PopTextWrapPos();
+    ui::ErrorText(f.error);
+    ImGui::Separator();
+
+    const char* action = f.mode == 2 ? "Remove password" : f.mode == 1 ? "Change password" : "Set password";
+    if ((f.mode == 2 ? ui::DangerButton(action) : ui::PrimaryButton(action))) {
+        f.error.clear();
+        if (f.mode != 0 && !(key_ && key_->matches(f.current))) {
+            f.error = "The current password is not correct.";
+        } else if (f.mode != 2 && f.next != f.repeat) {
+            f.error = "The new passwords don't match.";
+        } else {
+            try {
+                std::unique_ptr<FileKey> newKey;
+                if (f.mode != 2) newKey = FileKey::fromNewPassword(f.next);
+                book_->save(path_, newKey.get());  // re-encrypts (or decrypts) the file right away
+                key_ = std::move(newKey);
+                notify(f.mode == 0 ? "Password set" : f.mode == 1 ? "Password changed" : "Password removed");
+                company_.loaded = false;
+                ImGui::CloseCurrentPopup();
+            } catch (const std::exception& e) {
+                f.error = e.what();
+            }
+        }
+        if (f.error.empty()) {
+            crypto::wipe(f.current);
+            crypto::wipe(f.next);
+            crypto::wipe(f.repeat);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        crypto::wipe(f.current);
+        crypto::wipe(f.next);
+        crypto::wipe(f.repeat);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 }  // namespace obgui

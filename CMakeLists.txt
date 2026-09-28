@@ -25,12 +25,33 @@ add_library(openbooks_core
     src/book.cpp
     src/storage.cpp
     src/import.cpp
+    src/crypto.cpp
+    src/console.cpp
     src/pdf.cpp
     src/invoice_pdf.cpp
     src/reports.cpp
     src/cli.cpp
 )
 target_include_directories(openbooks_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Encryption primitives come from the platform, never from a download:
+#   Windows: CNG (bcrypt.dll, part of Windows)
+#   Linux/macOS: the system's preinstalled OpenSSL libcrypto (hard requirement)
+if(WIN32)
+    target_sources(openbooks_core PRIVATE src/crypto_cng.cpp)
+    target_link_libraries(openbooks_core PUBLIC bcrypt)
+else()
+    find_package(OpenSSL 1.1.1 COMPONENTS Crypto)
+    if(NOT OpenSSL_FOUND)
+        message(FATAL_ERROR
+            "OpenBooks needs a preinstalled OpenSSL (libcrypto, 1.1.1 or newer) for file encryption.\n"
+            "  Debian/Ubuntu: sudo apt install libssl-dev\n"
+            "  Fedora:        sudo dnf install openssl-devel\n"
+            "  macOS:         brew install openssl@3, then pass -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)")
+    endif()
+    target_sources(openbooks_core PRIVATE src/crypto_openssl.cpp)
+    target_link_libraries(openbooks_core PUBLIC OpenSSL::Crypto)
+endif()
 target_link_libraries(openbooks_core PRIVATE openbooks_warnings)
 if(MSVC)
     target_compile_options(openbooks_core PUBLIC /utf-8)
