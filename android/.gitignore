@@ -7,3 +7,8 @@ local.properties
 captures/
 *.apk
 *.aab
+
+# Release signing keys never belong in the repository.
+*.jks
+*.keystore
+keystore.properties

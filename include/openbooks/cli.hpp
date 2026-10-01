@@ -6,7 +6,7 @@
 
 namespace ob {
 
-constexpr const char* kVersion = "0.4.0";
+constexpr const char* kVersion = "0.5.0";
 
 // Runs one OpenBooks command line (argv without the program name). Returns the exit code.
 int runCli(const std::vector<std::string>& args, std::ostream& out, std::ostream& err, std::istream& in);
