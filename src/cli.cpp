@@ -145,8 +145,8 @@ Book& Context::books() {
         book = Book::loadWithKey(path, *key);  // already unlocked earlier in this session
     } else if (Book::isEncryptedFile(path)) {
         // OPENBOOKS_PASSWORD is for scripts; it is visible to other programs run by the same user.
-        const char* env = std::getenv("OPENBOOKS_PASSWORD");
-        std::string password = env && *env ? env : askPassword(*this, "Password for " + path + ": ");
+        std::string password = environmentUtf8("OPENBOOKS_PASSWORD");
+        if (password.empty()) password = askPassword(*this, "Password for " + path + ": ");
         try {
             book = Book::load(path, password, &key);
         } catch (...) {

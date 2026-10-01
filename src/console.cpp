@@ -10,6 +10,7 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <iostream>
 #endif
 
@@ -45,6 +46,23 @@ bool readHiddenConsoleLine(std::string& line) {
     return true;
 }
 
+std::string environmentUtf8(const char* name) {
+    std::wstring wideName(name, name + std::char_traits<char>::length(name));  // names are ASCII
+    const DWORD size = GetEnvironmentVariableW(wideName.c_str(), nullptr, 0);
+    if (size == 0) return {};
+    std::wstring wide(size, wchar_t{});
+    const DWORD length = GetEnvironmentVariableW(wideName.c_str(), &wide[0], size);
+    if (length == 0 || length >= size) return {};
+    std::string value;
+    const int n = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(length), nullptr, 0, nullptr, nullptr);
+    if (n > 0) {
+        value.resize(static_cast<std::size_t>(n));
+        WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(length), &value[0], n, nullptr, nullptr);
+    }
+    SecureZeroMemory(&wide[0], wide.size() * sizeof(wchar_t));
+    return value;
+}
+
 #else
 
 bool readHiddenConsoleLine(std::string& line) {
@@ -57,6 +75,11 @@ bool readHiddenConsoleLine(std::string& line) {
     std::getline(std::cin, line);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &original);
     return true;
+}
+
+std::string environmentUtf8(const char* name) {
+    const char* value = std::getenv(name);
+    return value ? value : "";
 }
 
 #endif

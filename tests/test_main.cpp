@@ -725,6 +725,12 @@ TEST(crypto_pbkdf2_known_answers) {
     crypto::pbkdf2Sha256("correct horse battery staple", salt, 16, 600000, out, 32);
     CHECK_EQ(hex(std::string_view(reinterpret_cast<char*>(out), 32)),
              std::string("ef177144eec9420cbc1093d2a8b344a92bc506d0d4ec9c028dd19f8324d8c1e6"));
+    // Non-ASCII passwords are hashed as their UTF-8 bytes on every platform ("pässwörd 🔒 日本");
+    // the Android app runs the same vector through javax.crypto.
+    crypto::pbkdf2Sha256(unhex("70c3a4737377c3b6726420f09f949220e697a5e69cac"),
+                         reinterpret_cast<const unsigned char*>("saltsaltsaltsalt"), 16, 1000, out, 32);
+    CHECK_EQ(hex(std::string_view(reinterpret_cast<char*>(out), 32)),
+             std::string("77ff06f439e514a0ebadd08748d6fa0887b36a9c9627a6663cc8ff9a0b554509"));
 }
 
 TEST(crypto_aes_gcm_known_answers) {
