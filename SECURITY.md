@@ -12,6 +12,7 @@ talks to the network.** Your books stay in one local file that you control.
   `ExternalProject` and package managers are not used). A build needs only a C++17
   compiler, CMake and the files in this repository. On Linux/macOS, the system's OpenSSL
   (for file encryption) and, for the desktop app, GLFW must already be installed.
+  The Android app is the one exception, with pinned checksums (see [Android](#android)).
 - **No URL launching.** Dear ImGui is compiled with `IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS`,
   which removes its built-in "open link" handler. OpenBooks only opens a local PDF it has
   just written ("Preview PDF"). It refuses anything that is not an existing local file given
@@ -68,18 +69,60 @@ no third-party code and no API for anything but text, lines and rectangles:
     encrypted.
 - **There is no password recovery.** A forgotten password means the books can't be
   opened by anyone.
-- **Scripts** can supply the password in `OPENBOOKS_PASSWORD`. Environment variables can be
+- **Scripts** can supply the password in `OPENBOOKS_PASSWORD` (read as UTF-8 on every platform,
+  so non-ASCII passwords match what the interactive prompt produces). Environment variables can be
   read by other programs running as the same user, so prefer the interactive prompt, which
   doesn't echo what you type.
 - The desktop app keeps only UI preferences and a recent-files list (file paths, no financial
   data) in `%APPDATA%\OpenBooks` (Windows), `~/.config/openbooks` (Linux) or
   `~/Library/Application Support/OpenBooks` (macOS). This config is not encrypted.
 
+## Android
+
+The Android app (`android/`) runs the same engine and reads and writes the same files.
+
+- **No network at runtime.** The app does not request the `INTERNET` permission, so Android
+  blocks every socket it could open. Sharing a PDF or CSV hands a file to an app *you* pick.
+- **Build-time downloads are the exception to "no downloads".** Android apps can't
+  realistically be built without Gradle, the Android Gradle Plugin, Kotlin and Jetpack
+  Compose, which Gradle downloads. To keep that supply chain honest:
+  - The Gradle distribution is pinned by SHA-256 in `gradle-wrapper.properties`. The committed
+    `gradle-wrapper.jar` matches Gradle's published checksum.
+  - `android/gradle/verification-metadata.xml` pins the SHA-256 of every artifact. A build fails
+    on any mismatch or on any artifact that isn't listed.
+  - Only Google's Maven (restricted to `com.android`, `com.google` and `androidx`) and Maven
+    Central are allowed, and modules can't add repositories.
+  - Runtime libraries are limited to Compose UI, Material 3 and activity-compose. The C++
+    engine itself still has no third-party code.
+- **Cryptography** comes from the platform's `javax.crypto` provider (PBKDF2WithHmacSHA256,
+  AES/GCM/NoPadding), called from C++ through JNI. Before any password is used, the app runs
+  the same known-answer tests as the desktop suite, plus a non-ASCII password vector. If any
+  fails, it refuses to create or open password-protected books. Files interoperate with the
+  Windows (CNG) and Linux/macOS (OpenSSL) builds in both directions; this is tested.
+- **Data at rest:**
+  - Books live in app-private storage. `allowBackup=false` and data-extraction rules keep them
+    out of cloud backups and device-to-device transfers.
+  - Android's file-based encryption protects that storage when the device is locked. A books
+    password adds protection for exported copies, and against anyone who can read app data.
+- **While password-protected books are open:**
+  - The window sets `FLAG_SECURE`, which blocks screenshots, screen recording and the
+    recent-apps thumbnail.
+  - The books lock after 5 minutes in the background.
+- **Exports:**
+  - PDFs and CSVs are written to a private cache folder. They leave only through a
+    `FileProvider` scoped to that folder, when you share them.
+  - That folder is emptied when books are closed.
+  - The request buffer that can carry a password is wiped after each call. Kotlin strings
+    can't be wiped reliably, so this is best effort, as on the desktop.
+
 ## Third-party code
 
 | Component | Version | Source | SHA-256 of release archive |
 |---|---|---|---|
 | Dear ImGui (MIT) | v1.92.9b | https://github.com/ocornut/imgui/archive/refs/tags/v1.92.9b.zip | `E1C46D676C2BCB7CED847BA27F50553E33A19DB97B3CADAEC7F8BE64449139F8` |
+
+The Android build's Gradle dependencies are not vendored. They are pinned by checksum in
+`android/gradle/verification-metadata.xml` instead (see [Android](#android)).
 
 Vendored files are copied unmodified into `third_party/imgui` (core, `misc/cpp/imgui_stdlib`,
 and the Win32, DX11, GLFW and OpenGL3 backends). To update, download the new release,

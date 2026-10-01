@@ -7,8 +7,8 @@ bank imports, reconciliation and standard financial reports. Your books live in 
 file that you own. It has no subscription, no cloud lock-in and no dependencies beyond a C++17
 compiler.
 
-> Status: 0.2. It ships a desktop app (`openbooks-gui`) and a scriptable command line
-> (`openbooks`), both working on the same books file. See the [roadmap](#roadmap) for what's next.
+> Status: 0.5. It ships a desktop app (`openbooks-gui`), an Android app, and a scriptable command
+> line (`openbooks`), all working on the same books file. See the [roadmap](#roadmap) for what's next.
 
 ## Desktop app
 
@@ -33,6 +33,14 @@ It runs on Win32 + Direct3D 11 on Windows, and GLFW + OpenGL 3 on Linux and macO
 
 Every change is saved the moment you make it, and failed changes are never half-applied.
 Open a file with `openbooks-gui path\to\books.obk`, or use File → Open.
+
+## Android app
+
+The Android app in [`android/`](android/README.md) has the same features as the desktop app,
+built with Kotlin and Jetpack Compose on the same C++ engine. It has no internet permission at
+all, and it opens the same `.obk` files, including password-protected ones. Build it with
+`cd android && ./gradlew assembleDebug`, or open the folder in Android Studio. See
+[android/README.md](android/README.md).
 
 ## Features
 
@@ -235,6 +243,7 @@ gui/                 desktop app
   app_reports.cpp    reports
   widgets.*          date picker, searchable pickers, money fields, report tables
   main_*.cpp         platform main loops (Win32/D3D11, GLFW/OpenGL3)
+android/             Android app (Kotlin/Compose UI, JNI bridge to the engine)
 tests/               self-contained test suite (no framework needed)
 third_party/imgui/   Dear ImGui 1.92.9b (MIT)
 ```
@@ -245,6 +254,7 @@ books in place. It applies each change to a copy, saves that copy, and only then
 ## Roadmap
 
 - [x] Desktop GUI
+- [x] Android app
 - [x] Native file dialogs on Linux/macOS
 - [x] Estimates, credit memos, sales receipts, recurring invoices
 - [ ] Customer refunds of unapplied credit; per-document-type PDF footers

@@ -15,7 +15,8 @@ These four rules are not negotiable. A change that breaks one won't be merged, h
 3. **Nothing talks to the network.** No sockets, HTTP, update checks or telemetry, and no
    build-time downloads (`FetchContent`, `ExternalProject`, package managers). See
    [SECURITY.md](SECURITY.md). Proposals that need the network start as a design discussion in
-   an issue and must be opt-in.
+   an issue and must be opt-in. The one exception is the Android build, which downloads
+   checksum-pinned Gradle dependencies (see [Android app guidelines](#android-app-guidelines-android)).
 4. **History is kept.** Records are voided, never deleted, and closed periods stay closed.
 
 ## Getting started
@@ -108,6 +109,20 @@ in them, so:
 - **Match the look.** Use the `ui::` widgets and theme colors (`colorAccent()`,
   `ui::statusColor()` …) rather than hard-coded colors, and check light *and* dark themes.
 
+## Android app guidelines (`android/`)
+
+- The app is a thin UI. Accounting rules belong in the engine; if the app needs something new,
+  add a JSON operation to `app/src/main/cpp/jni_bridge.cpp` that calls the engine.
+- Money crosses the bridge as decimal **strings** (the bridge rejects JSON floats). In Kotlin,
+  use `MoneyFmt` and `BigDecimal` for display and previews, never `Double`.
+- Never add the `INTERNET` permission, or anything that asks for it.
+- Dependencies are pinned. After changing `gradle/libs.versions.toml`, run
+  `./gradlew --write-verification-metadata sha256 help assembleDebug assembleRelease` and commit
+  the reviewed `verification-metadata.xml` diff with the change. New libraries need an issue
+  first, like any other dependency.
+- `./gradlew assembleDebug assembleRelease` must build without Kotlin or C++ warnings.
+- Test bridge changes on a desktop JVM (see android/README.md), then on an emulator.
+
 ## Code style
 
 Match the surrounding code. Specifically:
@@ -157,7 +172,7 @@ Copy this into your PR description:
 
 ## Checklist
 - [ ] Accounting changes keep the books balanced and have tests checking the balances
-- [ ] No network access, no new dependencies, no build-time downloads
+- [ ] No network access, no new dependencies, no build-time downloads (Android: pinned in `verification-metadata.xml`)
 - [ ] File format: older files still load; `kFileVersion` bumped if older releases would misread it
 - [ ] README / CLI help / SECURITY.md updated where behavior changed
 ```
