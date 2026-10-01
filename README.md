@@ -1,6 +1,6 @@
 # OpenBooks
 
-**Open source small-business accounting in modern C++. A free alternative to QuickBooks.**
+**Free, open source small-business accounting in modern C++.**
 
 OpenBooks is a real double-entry accounting system. It handles invoicing, bills, payments,
 bank imports, reconciliation and standard financial reports. Your books live in one plain-text
