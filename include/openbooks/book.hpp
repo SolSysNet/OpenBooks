@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openbooks/model.hpp"
+#include "openplugin/store.hpp"
 
 #include <iosfwd>
 #include <map>
@@ -40,6 +41,9 @@ enum class SystemAccount { Receivables, Payables, SalesTax, RetainedEarnings };
 class Book {
 public:
     Company company;
+    // Data that plugins keep in this file (PLUGIN records), saved and encrypted with it. Kept
+    // as-is when the plugin isn't installed, so files round-trip without loss.
+    opl::PluginStore plugins;
 
     // Adds a starter chart of accounts for a small service/retail business.
     void createDefaultChart();

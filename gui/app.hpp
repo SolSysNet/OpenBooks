@@ -9,12 +9,15 @@
 
 #include "openbooks/book.hpp"
 #include "openbooks/crypto.hpp"
+#include "openbooks/plugins.hpp"
 #include "openbooks/reports.hpp"
 
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -43,6 +46,8 @@ enum class Screen {
     CreditMemos,
     SalesReceipts,
     Recurring,
+    Plugins,      // Manage Plugins
+    PluginPanel,  // a screen a plugin shows (pluginPanel_)
 };
 
 // ------------------------------------------------------------ screen state
@@ -270,6 +275,73 @@ struct ConfirmRequest {
     std::function<void()> action;
 };
 
+// ------------------------------------------------------------- plugins (app_plugins.cpp)
+
+// A window or screen a plugin described (docs/design.md, section 10), with what the user typed.
+struct PluginView {
+    std::string pluginId;
+    std::string viewId;
+    std::string title;
+    std::string kind;          // "modal" or "panel"
+    opl::json::Value body;     // the element list
+    std::map<std::string, std::string> text;  // field id -> text (text, secret, money, choice, ...)
+    std::map<std::string, bool> flags;        // bool fields
+    std::map<std::string, int> ids;           // account / contact / invoice pickers
+    std::map<std::string, ob::Date> dates;
+    std::string error;
+    bool waiting = false;  // an event is with the plugin
+    bool popupOpen = false;
+    bool closing = false;  // the plugin asked to close it
+};
+
+struct PluginReview {
+    ob::plugins::Proposal proposal;
+    ob::plugins::Delegate::Decide decide;
+    std::vector<char> selected;
+    std::string error;
+};
+
+struct PluginSecretQuestion {
+    std::string pluginName;
+    std::function<void(bool)> answer;
+};
+
+struct PluginsScreenState {
+    std::vector<opl::PluginEntry> entries;  // cached: scanning hashes every plugin file
+    bool scanned = false;
+    std::string selected;  // plugin id, or the folder name of an invalid plugin
+    std::string registryError;
+    // The approval dialog.
+    std::string consentFolder;
+    std::map<std::string, bool> consentPermissions;
+    std::map<std::string, bool> consentHosts;
+    std::string consentError;
+    // The read-only file and log viewers.
+    std::string viewerTitle;
+    std::vector<std::pair<std::string, std::string>> files;  // path, text
+    int viewerFile = 0;
+    std::string logText;
+};
+
+class App;
+
+// What the plugin host asks of the desktop app.
+class GuiPluginDelegate : public ob::plugins::Delegate {
+public:
+    explicit GuiPluginDelegate(App& app) : app_(app) {}
+    const ob::Book* books() override;
+    bool encrypted() override;
+    void commit(const std::function<void(ob::Book&)>& change) override;
+    void review(ob::plugins::Proposal proposal, Decide decide) override;
+    void confirmUnencryptedSecret(const std::string& pluginName, std::function<void(bool)> answer) override;
+    bool pluginUi(const std::string& pluginId, const std::string& method, const opl::json::Value& params) override;
+    void notify(const std::string& pluginId, const std::string& level, const std::string& message) override;
+    std::optional<std::string> saveFile(const std::string& suggestedName, const std::string& content) override;
+
+private:
+    App& app_;
+};
+
 // Values derived from the books, rebuilt only when the books change.
 struct Derived {
     std::uint64_t version = 0;
@@ -317,6 +389,25 @@ private:
 
     // ---- screens (app.cpp)
     void drawDashboard();
+    // app_plugins.cpp
+    friend class GuiPluginDelegate;
+    friend struct AppTestAccess;  // tests/gui_smoke.cpp
+    void initPlugins();
+    void resetPluginSession();  // stops plugins and drops their windows and pending questions
+    void refreshPlugins();
+    const opl::PluginEntry* pluginEntry(const std::string& selected) const;
+    void drawPluginsMenu();
+    void drawPluginsScreen();
+    void drawPluginDetail(const opl::PluginEntry& e);
+    void drawPluginPanel();
+    void drawPluginModals();
+    void drawPluginStatus();
+    void openConsent(const opl::PluginEntry& e);
+    void runPluginCommand(const std::string& pluginId, const std::string& commandId, const std::string& title);
+    void handlePluginUi(const std::string& pluginId, const std::string& method, const opl::json::Value& params);
+    void renderPluginView(PluginView& v);
+    void sendPluginEvent(PluginView& v, const std::string& element, const char* action);
+    PluginView* findPluginView(const std::string& pluginId, const std::string& viewId);
     // app_sales.cpp
     void drawContacts(ob::ContactKind kind);
     void drawDocuments(ob::DocKind kind);
@@ -411,6 +502,14 @@ private:
     ItemForm itemForm_;
     ReportState report_;
     CompanyForm company_;
+
+    std::unique_ptr<GuiPluginDelegate> pluginDelegate_;
+    std::unique_ptr<ob::plugins::PluginHost> plugins_;
+    PluginsScreenState pluginsScreen_;
+    std::deque<PluginReview> reviews_;
+    std::deque<PluginSecretQuestion> secretQuestions_;
+    std::deque<PluginView> pluginViews_;  // deque: views are referenced while new ones are added
+    std::string pluginPanel_;              // "<plugin id>/<view id>" shown on Screen::PluginPanel
 };
 
 }  // namespace obgui

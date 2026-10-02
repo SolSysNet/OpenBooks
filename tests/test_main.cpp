@@ -5,6 +5,7 @@
 #include "openbooks/crypto.hpp"
 #include "openbooks/invoice_pdf.hpp"
 #include "openbooks/pdf.hpp"
+#include "openbooks/plugins.hpp"
 #include "openbooks/reports.hpp"
 
 #include <algorithm>
@@ -1236,6 +1237,294 @@ TEST(cli_end_to_end) {
 
     fs::remove_all(dir);
 }
+
+// ---------------------------------------------------------------- plugins
+
+namespace pl = ob::plugins;
+namespace json = opl::json;
+
+// The JSON-RPC error code a call fails with, or 0 if it succeeds.
+template <typename F>
+int remoteCode(F&& f) {
+    try {
+        f();
+    } catch (const opl::rpc::RemoteError& e) {
+        return e.code();
+    }
+    return 0;
+}
+
+std::string bookText(const Book& b) {
+    std::ostringstream out;
+    b.write(out);
+    return out.str();
+}
+
+TEST(plugin_data_round_trips_in_the_books_file) {
+    Fixture f;
+    // No plugin data: still version 2, so older OpenBooks releases keep opening the file.
+    CHECK_EQ(bookText(f.b).rfind("OPENBOOKS\t2\n", 0), std::size_t(0));
+
+    f.b.plugins.set("org.example.pay", "apiKey", "rk_live_123", true);
+    f.b.plugins.set("org.example.pay", "note", "tabs\tand\nnewlines \\ survive", false);
+    f.b.plugins.setUsedWithFile("org.example.pay", true);
+    const std::string text = bookText(f.b);
+    CHECK_EQ(text.rfind("OPENBOOKS\t3\n", 0), std::size_t(0));
+    CHECK(text.find("PLUGIN\torg.example.pay\tapiKey\tsecret\trk_live_123\n") != std::string::npos);
+
+    std::istringstream in(text);
+    const Book back = Book::read(in);
+    CHECK(back.plugins == f.b.plugins);
+    CHECK(back.plugins.get("org.example.pay", "apiKey")->secret);
+    CHECK_EQ(back.plugins.get("org.example.pay", "note")->value, std::string("tabs\tand\nnewlines \\ survive"));
+    CHECK(back.plugins.usedWithFile("org.example.pay"));
+
+    const auto bad = [](const std::string& line) {
+        std::istringstream s("OPENBOOKS\t3\n" + line + "\n");
+        Book::read(s);
+    };
+    CHECK_THROWS(bad("PLUGIN\tNot An Id\tk\t\tv"));
+    CHECK_THROWS(bad("PLUGIN\torg.example.pay\tk\tshared\tv"));
+    CHECK_THROWS(bad("PLUGIN\torg.example.pay\t\t\tv"));
+    CHECK_THROWS(bad("PLUGIN\torg.example.pay\tk"));
+    CHECK_THROWS(bad("PLUGINS\torg.example.pay\tk\t\tv"));
+    std::istringstream newer("OPENBOOKS\t4\n");
+    CHECK_THROWS(Book::read(newer));
+}
+
+TEST(plugin_data_is_encrypted_with_the_file) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "openbooks-plugin-crypto";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string path = (dir / "books.obk").u8string();
+    Fixture f;
+    f.b.plugins.set("org.example.pay", "apiKey", "rk_live_SECRET", true);
+    const auto key = FileKey::fromNewPassword("correct horse battery");
+    f.b.save(path, key.get());
+    std::string bytes;
+    {
+        std::ifstream raw(fs::u8path(path), std::ios::binary);
+        bytes.assign((std::istreambuf_iterator<char>(raw)), std::istreambuf_iterator<char>());
+    }
+    CHECK(bytes.find("rk_live_SECRET") == std::string::npos);
+    CHECK(bytes.find("PLUGIN") == std::string::npos);
+    const Book back = Book::load(path, "correct horse battery");
+    CHECK_EQ(back.plugins.get("org.example.pay", "apiKey")->value, std::string("rk_live_SECRET"));
+    fs::remove_all(dir);
+}
+
+TEST(plugin_views_respect_permissions) {
+    Fixture f;
+    const int inv = f.invoice("2026-09-01", M("125.00"), Q("10"));
+    f.bill("2026-09-02", M("900.00"));
+    f.receive("2026-09-10", M("250.00"), {Application{inv, M("250.00")}});
+    const std::vector<std::string> none, invoices = {"read:invoices"}, all = {"read:company", "read:contacts", "read:invoices",
+                                                                                "read:bills", "read:payments", "read:ledger"};
+
+    CHECK_EQ(remoteCode([&] { pl::readView(f.b, "invoices", json::Value(), none); }), int(opl::rpc::PermissionDenied));
+    CHECK_EQ(remoteCode([&] { pl::readView(f.b, "bills", json::Value(), invoices); }), int(opl::rpc::PermissionDenied));
+    CHECK_EQ(remoteCode([&] { pl::readView(f.b, "accounts", json::Value(), invoices); }), int(opl::rpc::PermissionDenied));
+    CHECK_EQ(remoteCode([&] { pl::readView(f.b, "secrets", json::Value(), all); }), int(opl::rpc::InvalidParams));
+    // Each permission's views exist and are readable with it.
+    for (const pl::ViewInfo& v : pl::views()) {
+        json::Value q = json::Object{};
+        if (std::string(v.name) == "contact") q = json::Object{{"id", f.acme}};
+        if (std::string(v.name) == "invoice") q = json::Object{{"id", inv}};
+        if (std::string(v.name) == "bill") continue;
+        CHECK_EQ(remoteCode([&] { pl::readView(f.b, v.name, q, {v.permission}); }), 0);
+    }
+
+    const json::Value list = pl::readView(f.b, "invoices", json::Value(), invoices);
+    CHECK_EQ(list.asArray().size(), std::size_t(1));
+    const json::Value& i = list.asArray()[0];
+    CHECK_EQ(i.find("total")->asString(), std::string("1250.00"));
+    CHECK_EQ(i.find("balance")->asString(), std::string("1000.00"));
+    CHECK_EQ(i.find("kind")->asString(), std::string("invoice"));
+    CHECK_EQ(i.find("contactName")->asString(), std::string("Acme Corp"));
+    CHECK_EQ(i.find("lines")->asArray()[0].find("quantity")->asString(), std::string("10"));
+
+    CHECK_EQ(pl::readView(f.b, "invoices", json::Object{{"status", "open"}}, invoices).asArray().size(), std::size_t(1));
+    CHECK_EQ(pl::readView(f.b, "invoices", json::Object{{"since", "2026-09-02"}}, invoices).asArray().size(), std::size_t(0));
+    CHECK_EQ(pl::readView(f.b, "invoices", json::Object{{"contact", f.landlord}}, invoices).asArray().size(), std::size_t(0));
+    CHECK_EQ(remoteCode([&] { pl::readView(f.b, "invoices", json::Object{{"since", "09/02/2026"}}, invoices); }), int(opl::rpc::InvalidParams));
+    CHECK_EQ(remoteCode([&] { pl::readView(f.b, "invoices", json::Object{{"status", "paid"}}, invoices); }), int(opl::rpc::InvalidParams));
+    // A bill can't be read through the invoice view, or the other way round.
+    const int billId = f.b.documents().back().id;
+    CHECK_EQ(remoteCode([&] { pl::readView(f.b, "invoice", json::Object{{"id", billId}}, all); }), int(opl::rpc::InvalidParams));
+    CHECK_EQ(remoteCode([&] { pl::readView(f.b, "bill", json::Object{{"id", inv}}, all); }), int(opl::rpc::InvalidParams));
+    CHECK_EQ(pl::readView(f.b, "bill", json::Object{{"id", billId}}, {"read:bills"}).find("total")->asString(), std::string("900.00"));
+
+    const json::Value pays = pl::readView(f.b, "payments", json::Value(), {"read:payments"});
+    CHECK_EQ(pays.asArray()[0].find("applications")->asArray()[0].find("amount")->asString(), std::string("250.00"));
+    const json::Value accounts = pl::readView(f.b, "accounts", json::Value(), {"read:ledger"});
+    bool sawChecking = false;
+    for (const json::Value& a : accounts.asArray())
+        if (a.find("id")->asInt() == f.checking) {
+            sawChecking = true;
+            CHECK_EQ(a.find("balance")->asString(), std::string("250.00"));
+            CHECK_EQ(a.find("type")->asString(), std::string("asset"));
+        }
+    CHECK(sawChecking);
+}
+
+json::Value paymentChange(int contact, int account, const char* amount, int invoice = 0) {
+    json::Object c{{"op", "recordPayment"}, {"contact", contact}, {"date", "2026-09-30"}, {"account", account}, {"amount", amount}, {"ref", "pi_1"}};
+    if (invoice) c.set("applications", json::Array{json::Object{{"document", invoice}, {"amount", amount}}});
+    return json::Value(std::move(c));
+}
+
+TEST(plugin_proposals_are_checked_and_described) {
+    Fixture f;
+    const int inv = f.invoice("2026-09-01", M("125.00"), Q("10"));
+    const std::vector<std::string> perms = {"propose:payments", "propose:transactions", "store"};
+    const auto parse = [&](json::Value params, std::vector<std::string> p) {
+        return pl::parseProposal(f.b, "org.example.pay", "Pay", params, p);
+    };
+    const auto wrap = [](json::Value change) {
+        return json::Value(json::Object{{"summary", "Import"}, {"changes", json::Array{std::move(change)}}});
+    };
+
+    const pl::Proposal p = parse(wrap(paymentChange(f.acme, f.checking, "1250.00", inv)), perms);
+    CHECK_EQ(p.changes.size(), std::size_t(1));
+    CHECK_EQ(p.changes[0].description,
+             std::string("Receive 1,250.00 from Acme Corp into Checking on 2026-09-30, for invoice 1001 (1,250.00) [ref pi_1]"));
+
+    const int bad = int(opl::rpc::InvalidParams);
+    CHECK_EQ(remoteCode([&] { parse(wrap(paymentChange(f.acme, f.checking, "1250.00")), {}); }), int(opl::rpc::PermissionDenied));
+    CHECK_EQ(remoteCode([&] { parse(wrap(json::Object{{"op", "deleteEverything"}}), perms); }), bad);
+    CHECK_EQ(remoteCode([&] { parse(wrap(paymentChange(f.landlord, f.checking, "10.00")), perms); }), bad);  // a vendor
+    CHECK_EQ(remoteCode([&] { parse(wrap(paymentChange(f.acme, 9999, "10.00")), perms); }), bad);
+    CHECK_EQ(remoteCode([&] { parse(wrap(paymentChange(f.acme, f.checking, "1,250.00")), perms); }), bad);
+    CHECK_EQ(remoteCode([&] { parse(wrap(paymentChange(f.acme, f.checking, "-5.00")), perms); }), bad);
+    CHECK_EQ(remoteCode([&] { parse(wrap(paymentChange(f.acme, f.checking, "1.234")), perms); }), bad);
+    CHECK_EQ(remoteCode([&] { parse(json::Object{{"changes", json::Array{paymentChange(f.acme, f.checking, "1.00")}}}, perms); }), bad);
+    CHECK_EQ(remoteCode([&] { parse(json::Object{{"summary", "x"}, {"changes", json::Array{}}}, perms); }), bad);
+
+    json::Object withStore{{"summary", "x"}, {"changes", json::Array{paymentChange(f.acme, f.checking, "1.00")}}, {"store", json::Object{{"@use", "0"}}}};
+    CHECK_EQ(remoteCode([&] { parse(json::Value(withStore), perms); }), bad);
+    withStore.set("store", json::Object{{"cursor", "abc"}});
+    CHECK_EQ(remoteCode([&] { parse(json::Value(withStore), {"propose:payments"}); }), int(opl::rpc::PermissionDenied));
+
+    const json::Value fee = json::Object{{"op", "postTransaction"}, {"kind", "expense"}, {"date", "2026-09-30"}, {"memo", "Stripe fee"},
+                                         {"splits", json::Array{json::Object{{"account", f.rent}, {"debit", "36.55"}},
+                                                                json::Object{{"account", f.checking}, {"credit", "36.55"}}}}};
+    CHECK_EQ(parse(wrap(fee), perms).changes[0].description,
+             std::string("Expense on 2026-09-30 (Stripe fee): debit Rent 36.55; credit Checking 36.55"));
+}
+
+TEST(plugin_proposals_apply_all_or_nothing) {
+    Fixture f;
+    const int inv = f.invoice("2026-09-01", M("125.00"), Q("10"));
+    const std::vector<std::string> perms = {"propose:payments", "propose:transactions", "store"};
+    // The second change doesn't balance: Book::postTransaction refuses it when applied.
+    const json::Value unbalanced = json::Object{{"op", "postTransaction"}, {"date", "2026-09-30"},
+                                                {"splits", json::Array{json::Object{{"account", f.rent}, {"debit", "10.00"}},
+                                                                       json::Object{{"account", f.checking}, {"credit", "9.00"}}}}};
+    const pl::Proposal p = pl::parseProposal(
+        f.b, "org.example.pay", "Pay",
+        json::Object{{"summary", "x"}, {"changes", json::Array{paymentChange(f.acme, f.checking, "1250.00", inv), unbalanced}},
+                     {"store", json::Object{{"cursor", "evt_9"}}}},
+        perms);
+
+    Book copy = f.b;
+    CHECK_THROWS(pl::applyProposal(copy, p));
+    CHECK_EQ(f.b.documentBalance(inv), M("1250.00"));  // the original is untouched
+
+    Book selected = f.b;
+    const std::vector<int> ids = pl::applyProposal(selected, p, {true, false});
+    CHECK_EQ(ids.size(), std::size_t(1));
+    CHECK(selected.documentBalance(inv).isZero());
+    CHECK_EQ(selected.plugins.get("org.example.pay", "cursor")->value, std::string("evt_9"));
+}
+
+#ifdef OPENBOOKS_TEST_RUNNER
+// Runs real Lua plugins through `openbooks plugin`, with the runner built next to this test program.
+TEST(plugin_cli_end_to_end) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "openbooks-plugin-cli";
+    fs::remove_all(dir);
+    const fs::path pluginDir = dir / "config" / "plugins" / "pay";
+    fs::create_directories(pluginDir);
+#ifdef _WIN32
+    _putenv_s("OPENBOOKS_CONFIG_DIR", (dir / "config").string().c_str());
+#else
+    setenv("OPENBOOKS_CONFIG_DIR", (dir / "config").string().c_str(), 1);
+#endif
+    {
+        std::ofstream(pluginDir / "plugin.json")
+            << R"({"schema":1,"id":"org.example.pay","name":"Pay Demo","version":"1.0.0","publisher":"Tests",)"
+            << R"("apps":{"openbooks":">=0.5"},"protocol":1,"runtime":"lua","main":"main.lua",)"
+            << R"("permissions":["read:invoices","propose:payments","store"],"commands":[{"id":"sync","title":"Sync"}]})";
+        std::ofstream(pluginDir / "main.lua") << R"(
+op.command("sync", function(ctx)
+  local open = op.read("invoices", { status = "open" })
+  local inv = open[1]
+  local r = op.propose{ summary = "Import 1 payment",
+    changes = { { op = "recordPayment", contact = inv.contact, date = "2026-09-30", account = ctx.account,
+                  amount = inv.balance, applications = { { document = inv.id, amount = inv.balance } } } },
+    store = { cursor = "pi_1" } }
+  return { applied = r.applied, invoice = inv.number }
+end)
+)";
+    }
+    const std::string file = (dir / "books.obk").u8string();
+    CHECK_EQ(cli(file, {"init", "--company", "Test Co"}).code, 0);
+    CHECK_EQ(cli(file, {"customer", "add", "Acme"}).code, 0);
+    CHECK_EQ(cli(file, {"invoice", "create", "--customer", "Acme", "--line", "desc=Work;amount=300;account=Service Revenue"}).code, 0);
+    const std::string checking = std::to_string(Book::load(file).findAccount("Checking").id);
+    const std::string context = "{\"account\":" + checking + "}";
+
+    auto r = cli(file, {"plugin", "list"});
+    CHECK(r.out.find("not enabled") != std::string::npos);
+    CHECK_EQ(cli(file, {"plugin", "run", "org.example.pay", "sync"}).code, 1);  // not enabled
+    r = cli(file, {"plugin", "enable", "org.example.pay"}, "n\n");
+    CHECK_EQ(r.code, 1);  // declined at the prompt
+    CHECK(r.out.find("Lua script in openplugin-runner's sandbox") != std::string::npos);
+    CHECK_EQ(cli(file, {"plugin", "enable", "org.example.pay", "--yes"}).code, 0);
+    r = cli(file, {"plugin", "run", "org.example.pay", "sync", "--context", context});
+    CHECK_EQ(r.code, 1);
+    CHECK(r.err.find("isn't turned on for this books file") != std::string::npos);
+    CHECK_EQ(cli(file, {"plugin", "use", "org.example.pay"}).code, 0);
+
+    // Declining the review changes nothing.
+    r = cli(file, {"plugin", "run", "org.example.pay", "sync", "--context", context}, "n\n");
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.find("Receive 300.00 from Acme into Checking") != std::string::npos);
+    CHECK(r.out.find("\"applied\": false") != std::string::npos);
+    CHECK_EQ(Book::load(file).documentBalance(Book::load(file).documents()[0].id), M("300.00"));
+
+    r = cli(file, {"plugin", "run", "org.example.pay", "sync", "--context", context}, "y\n");
+    CHECK_EQ(r.code, 0);
+    CHECK(r.out.find("\"applied\": true") != std::string::npos);
+    const Book after = Book::load(file);
+    CHECK(after.documentBalance(after.documents()[0].id).isZero());
+    CHECK_EQ(after.plugins.get("org.example.pay", "cursor")->value, std::string("pi_1"));
+    CHECK(cli(file, {"plugin", "data", "org.example.pay"}).out.find("pi_1") != std::string::npos);
+
+    // Changing any file means approving it again.
+    std::ofstream(pluginDir / "main.lua", std::ios::app) << "\n-- edited\n";
+    r = cli(file, {"plugin", "run", "org.example.pay", "sync", "--context", context});
+    CHECK_EQ(r.code, 1);
+    CHECK(r.err.find("needs your approval again") != std::string::npos);
+
+    // Granting less than requested: the plugin is refused what it wasn't given.
+    CHECK_EQ(cli(file, {"plugin", "enable", "org.example.pay", "--grant", "store", "--yes"}).code, 0);
+    r = cli(file, {"plugin", "run", "org.example.pay", "sync", "--context", context});
+    CHECK_EQ(r.code, 1);
+    CHECK(r.err.find("read:invoices permission, which wasn't granted") != std::string::npos);
+
+    CHECK_EQ(cli(file, {"plugin", "data", "org.example.pay", "--remove", "--yes"}).code, 0);
+    CHECK(Book::load(file).plugins.entries("org.example.pay").empty());
+    CHECK_EQ(cli(file, {"plugin", "disable", "org.example.pay"}).code, 0);
+#ifdef _WIN32
+    _putenv_s("OPENBOOKS_CONFIG_DIR", "");
+#else
+    unsetenv("OPENBOOKS_CONFIG_DIR");
+#endif
+    fs::remove_all(dir);
+}
+#endif
 
 }  // namespace
 

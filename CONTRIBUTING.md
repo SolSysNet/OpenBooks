@@ -12,10 +12,11 @@ These four rules are not negotiable. A change that breaks one won't be merged, h
    balances, and the sub-ledgers (open invoices, bills and credits) agree with A/R and A/P.
 2. **Money is never floating point.** Use `ob::Money` (integer cents) and `ob::Decimal`
    (quantities and rates). Rounding happens in one place, `multiply()` / `percentOf()`.
-3. **Nothing talks to the network.** No sockets, HTTP, update checks or telemetry, and no
-   build-time downloads (`FetchContent`, `ExternalProject`, package managers). See
-   [SECURITY.md](SECURITY.md). Proposals that need the network start as a design discussion in
-   an issue and must be opt-in. The one exception is the Android build, which downloads
+3. **Nothing talks to the network.** No sockets, HTTP, update checks or telemetry in the engine,
+   the CLI or the desktop app, and no build-time downloads (`FetchContent`, `ExternalProject`,
+   package managers). See [SECURITY.md](SECURITY.md). Features that need the network belong in a
+   plugin (see [Plugins](README.md#plugins)); the only network code is `openplugin-runner` in
+   `third_party/openplugin`, and changes there start as a design discussion in an issue. The one exception is the Android build, which downloads
    checksum-pinned Gradle dependencies (see [Android app guidelines](#android-app-guidelines-android)).
 4. **History is kept.** Records are voided, never deleted, and closed periods stay closed.
 

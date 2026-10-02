@@ -95,6 +95,7 @@ App::App(std::string initialPath) {
     applyTheme(darkTheme_);
     newCompany_.path = (fs::u8path(documentsDirectory()) / "My Company.obk").u8string();
     newCompany_.name = "My Company";
+    initPlugins();
 
     if (!initialPath.empty()) {
         openBooks(initialPath);
@@ -106,6 +107,8 @@ App::App(std::string initialPath) {
 }
 
 App::~App() {
+    resetPluginSession();
+    plugins_.reset();  // stops every plugin
     saveConfig();
     clearPreviews();
 }
@@ -168,6 +171,7 @@ bool App::openBooks(std::string path, std::string password) {  // by value, see 
         }
         Book loaded = Book::load(path, password, &key);
         crypto::wipe(password);
+        resetPluginSession();  // plugins never carry over from one file to another
         book_ = std::move(loaded);
         key_ = std::move(key);  // null for unencrypted files
     } catch (const WrongPasswordError& e) {
@@ -205,6 +209,7 @@ bool App::openBooks(std::string path, std::string password) {  // by value, see 
 }
 
 void App::closeBooks() {
+    resetPluginSession();
     book_.reset();
     key_.reset();  // wipes the key
     path_.clear();
@@ -232,6 +237,7 @@ bool App::commit(const std::function<void(Book&)>& change, std::string* error, c
         ++version_;
         if (error) error->clear();
         if (!success.empty()) notify(success);
+        if (plugins_) plugins_->event("fileSaved", opl::json::Object{});
         return true;
     } catch (const std::exception& e) {
         if (error) *error = e.what();
@@ -289,6 +295,7 @@ std::string App::windowTitle() const {
 }
 
 bool App::wantsFrequentRedraw() const {
+    if (plugins_ && plugins_->busy()) return true;  // keep polling while plugins are working
     if (notice_.empty()) return false;
     const float age = std::chrono::duration<float>(std::chrono::steady_clock::now() - noticeTime_).count();
     return age < kNoticeSeconds + 1.0f;
@@ -341,6 +348,7 @@ void App::frame() {
 }
 
 void App::drawFrame() {
+    if (plugins_) plugins_->poll();  // plugin callbacks run here, on the UI thread
     drawMenuBar();
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -392,6 +400,8 @@ void App::drawFrame() {
             case Screen::CreditMemos: drawDocuments(DocKind::CreditMemo); break;
             case Screen::SalesReceipts: drawDocuments(DocKind::SalesReceipt); break;
             case Screen::Recurring: drawRecurring(); break;
+            case Screen::Plugins: drawPluginsScreen(); break;
+            case Screen::PluginPanel: drawPluginPanel(); break;
         }
         ImGui::EndChild();
         ImGui::PopStyleVar();
@@ -456,6 +466,7 @@ void App::drawMenuBar() {
         }
         ImGui::EndMenu();
     }
+    drawPluginsMenu();
     if (ImGui::BeginMenu("Help")) {
         if (ImGui::MenuItem("About OpenBooks")) requestPopup("About OpenBooks");
         ImGui::EndMenu();
@@ -508,6 +519,22 @@ void App::drawSidebar() {
             if (ImGui::Selectable(e.label, selected)) go(e.screen);
         }
     }
+
+    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::PushFont(nullptr, kBaseFontSize * 0.8f);
+    ui::Muted("PLUGINS");
+    ImGui::PopFont();
+    if (ImGui::Selectable("Manage Plugins", screen_ == Screen::Plugins)) go(Screen::Plugins);
+    for (const PluginView& v : pluginViews_) {
+        if (v.kind != "panel") continue;
+        const std::string key = v.pluginId + "/" + v.viewId;
+        ImGui::PushID(key.c_str());
+        if (ImGui::Selectable(v.title.c_str(), screen_ == Screen::PluginPanel && pluginPanel_ == key)) {
+            pluginPanel_ = key;
+            go(Screen::PluginPanel);
+        }
+        ImGui::PopID();
+    }
 }
 
 void App::drawStatusBar() {
@@ -519,6 +546,7 @@ void App::drawStatusBar() {
         ImGui::SameLine();
         ui::Badge("Password protected", colorPositive());
     }
+    drawPluginStatus();
     if (notice_.empty()) return;
     const float age = std::chrono::duration<float>(std::chrono::steady_clock::now() - noticeTime_).count();
     if (age > kNoticeSeconds) return;
@@ -694,6 +722,7 @@ void App::drawModals() {
     drawTransactionModal();
     drawApplyCreditModal();
     drawPasswordModal();
+    drawPluginModals();
 }
 
 // ------------------------------------------------------------- dashboard

@@ -9,6 +9,8 @@
 
 #include "platform.hpp"
 
+#include "openbooks/paths.hpp"
+
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -240,23 +242,8 @@ bool openWithDefaultApp(const std::string& path) {
     return r && r->exitCode == 0;
 }
 
-std::string configDirectory() {
-    std::filesystem::path dir;
-    if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg && *xdg) {
-        dir = std::filesystem::path(xdg) / "openbooks";
-    } else if (const char* home = std::getenv("HOME"); home && *home) {
-#ifdef __APPLE__
-        dir = std::filesystem::path(home) / "Library" / "Application Support" / "OpenBooks";
-#else
-        dir = std::filesystem::path(home) / ".config" / "openbooks";
-#endif
-    } else {
-        dir = std::filesystem::current_path();
-    }
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir.string();
-}
+// Shared with the command line, so both find the same plugins and settings.
+std::string configDirectory() { return ob::userConfigDirectory(); }
 
 const char* const* preferredFonts() {
     static const char* const fonts[] = {

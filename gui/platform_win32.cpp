@@ -1,5 +1,7 @@
 #include "platform.hpp"
 
+#include "openbooks/paths.hpp"
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -91,19 +93,8 @@ bool openWithDefaultApp(const std::string& path) {
     return result > 32;
 }
 
-std::string configDirectory() {
-    wchar_t* appData = nullptr;
-    std::filesystem::path dir;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData))) {
-        dir = std::filesystem::path(appData) / L"OpenBooks";
-    } else {
-        dir = std::filesystem::current_path();
-    }
-    CoTaskMemFree(appData);
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return narrow(dir.wstring());
-}
+// Shared with the command line, so both find the same plugins and settings.
+std::string configDirectory() { return ob::userConfigDirectory(); }
 
 const char* const* preferredFonts() {
     static const char* const fonts[] = {"C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\arial.ttf", nullptr};

@@ -42,6 +42,25 @@ all, and it opens the same `.obk` files, including password-protected ones. Buil
 `cd android && ./gradlew assembleDebug`, or open the folder in Android Studio. See
 [android/README.md](android/README.md).
 
+## Plugins
+
+Plugins add optional features that OpenBooks itself leaves out, such as payment portals. A plugin is
+a folder with a `plugin.json` and Lua scripts, run by `openplugin-runner` in a sandbox: it can't
+read your files, it reaches only the servers you approve, and it can't change your books without
+you reviewing every change first. OpenBooks itself still never touches the network.
+
+```bash
+openbooks plugin list                         # what's installed in your settings folder's plugins/
+openbooks plugin show org.example.payments    # what it asks for, and its files
+openbooks plugin enable org.example.payments  # approve it (you can grant less with --grant/--hosts)
+openbooks plugin use org.example.payments     # turn it on for this books file
+openbooks plugin run org.example.payments sync
+```
+
+In the desktop app it's the **Plugins** menu and **Plugins → Manage Plugins**. Writing a plugin:
+[third_party/openplugin/docs/lua-api.md](third_party/openplugin/docs/lua-api.md). How it is kept
+safe: [SECURITY.md](SECURITY.md#plugins).
+
 ## Features
 
 | Area | What you get |
@@ -75,7 +94,10 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-This produces `openbooks` (CLI), `openbooks-gui` (desktop app) and `openbooks_tests`. With
+This produces `openbooks` (CLI), `openbooks-gui` (desktop app), `openplugin-runner` (runs Lua
+plugins; the only program with network code) and the tests. On Linux the runner needs the system
+libcurl (`sudo apt install libcurl4-openssl-dev` or `sudo dnf install libcurl-devel`); macOS has it.
+Add `-DOPENBOOKS_BUILD_PLUGIN_RUNNER=OFF` to leave the runner out. With
 Visual Studio generators they land in `build\Release\`. On MinGW the executables are linked
 statically, so they run with no extra DLLs.
 
@@ -216,8 +238,10 @@ are no manual closing entries to make.
 
 ## File format
 
-A `.obk` file is UTF-8 text with one tab-separated record per line (`OPENBOOKS 1` header, then
-`COMPANY`, `ACCOUNT`, `CONTACT`, `ITEM`, `TXN`/`SPLIT`, `DOC`/`LINE`, `PAY`/`APPLY`). It's
+A `.obk` file is UTF-8 text with one tab-separated record per line (an `OPENBOOKS` header with
+the format version, then `COMPANY`, `ACCOUNT`, `CONTACT`, `ITEM`, `TXN`/`SPLIT`, `DOC`/`LINE`,
+`PAY`/`APPLY`, and `PLUGIN` for data plugins keep in the file). Files only use version 3 once a
+plugin has saved something in them, so books that never used a plugin still open in 0.5. It's
 easy to diff, back up and version-control, and you can recover it by hand if needed. See
 [src/storage.cpp](src/storage.cpp) for the exact layout.
 
@@ -233,6 +257,8 @@ include/openbooks/   public headers
   import.hpp         bank/card CSV import
   pdf.hpp            minimal, dependency-free PDF writer
   invoice_pdf.hpp    invoice/bill PDF layout
+  plugins.hpp        what plugins see (views), proposals, and the plugin host
+  paths.hpp          settings folder and program location
   cli.hpp            command-line front end
 src/                 engine + CLI implementation
 gui/                 desktop app
@@ -241,11 +267,13 @@ gui/                 desktop app
   app_banking.cpp    registers, quick entries, CSV import, reconciliation, journal
   app_setup.cpp      chart of accounts, items, company settings
   app_reports.cpp    reports
+  app_plugins.cpp    Plugins menu and screen, approval, change review, plugin windows
   widgets.*          date picker, searchable pickers, money fields, report tables
   main_*.cpp         platform main loops (Win32/D3D11, GLFW/OpenGL3)
 android/             Android app (Kotlin/Compose UI, JNI bridge to the engine)
-tests/               self-contained test suite (no framework needed)
+tests/               self-contained test suite (no framework needed), headless GUI smoke test
 third_party/imgui/   Dear ImGui 1.92.9b (MIT)
+third_party/openplugin/  plugin host and openplugin-runner, with Lua 5.4.9 (MIT)
 ```
 
 The engine (`openbooks_core`) doesn't depend on either front end. The GUI never edits the
@@ -259,6 +287,8 @@ books in place. It applies each change to a copy, saves that copy, and only then
 - [x] Estimates, credit memos, sales receipts, recurring invoices
 - [ ] Customer refunds of unapplied credit; per-document-type PDF footers
 - [x] PDF invoices and bills
+- [x] Plugins (sandboxed Lua, approved per plugin and per file)
+- [ ] Payment portal plugins (`openbooks.payments`: pay links on invoices, importing payments)
 - [ ] Company logo on PDFs; email delivery (would need an explicit, opt-in network design)
 - [ ] Inventory quantity tracking and COGS
 - [ ] Classes/locations, budgets, cash-basis reports
@@ -270,7 +300,8 @@ books in place. It applies each change to a copy, saves that copy, and only then
 ## Contributing
 
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first. The short version:
-**the Balance Sheet must always balance, money is never a `double`, and nothing talks to the network.**
+**the Balance Sheet must always balance, money is never a `double`, and OpenBooks itself never talks
+to the network** (plugins do that, through `openplugin-runner`).
 
 ## License
 

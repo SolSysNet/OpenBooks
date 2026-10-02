@@ -4,6 +4,7 @@
 #include "openbooks/crypto.hpp"
 #include "openbooks/import.hpp"
 #include "openbooks/invoice_pdf.hpp"
+#include "openbooks/plugins.hpp"
 #include "openbooks/reports.hpp"
 #include "openbooks/util.hpp"
 
@@ -27,7 +28,7 @@ namespace {
 
 // Options that never take a value.
 const std::set<std::string> kFlags = {"csv", "open", "all", "finish", "empty", "no-header", "negate", "non-taxable", "force", "password",
-                                      "help"};
+                                      "help", "yes", "off", "remove"};
 
 class Args {
 public:
@@ -1108,6 +1109,243 @@ void cmdReconcile(Context& c, Args& a) {
 
 using Handler = std::function<void(Context&, Args&)>;
 
+// ---------------------------------------------------------------- plugins
+
+namespace json = opl::json;
+
+bool askYesNo(Context& c, const std::string& question) {
+    c.err << question << " [y/N] " << std::flush;
+    std::string answer;
+    if (!std::getline(c.in, answer)) return false;
+    answer = toLower(trim(answer));
+    return answer == "y" || answer == "yes";
+}
+
+// The command line as a plugin front end: proposals and warnings become y/N questions, and there is
+// no plugin UI.
+class CliPluginDelegate : public plugins::Delegate {
+public:
+    CliPluginDelegate(Context& c, bool yes) : c_(c), yes_(yes) {}
+
+    const Book* books() override { return &c_.books(); }
+    bool encrypted() override {
+        c_.books();
+        return c_.key != nullptr;
+    }
+    void commit(const std::function<void(Book&)>& change) override {
+        Book draft = c_.books();
+        change(draft);
+        draft.save(c_.path, c_.key.get());
+        *c_.book = std::move(draft);
+    }
+    void review(plugins::Proposal p, Decide decide) override {
+        c_.out << '\n' << p.pluginName << " proposes: " << p.summary << '\n';
+        for (std::size_t i = 0; i < p.changes.size(); ++i) c_.out << "  " << (i + 1) << ". " << p.changes[i].description << '\n';
+        const bool apply = yes_ || askYesNo(c_, "Apply these changes?");
+        const std::string error = decide(apply, {});
+        if (!error.empty()) {
+            c_.err << "error: the changes were not applied: " << error << '\n';
+            decide(false, {});
+        } else if (apply) {
+            c_.out << "Applied.\n";
+        }
+    }
+    void confirmUnencryptedSecret(const std::string& pluginName, std::function<void(bool)> answer) override {
+        c_.err << "warning: " << pluginName
+               << " wants to save a secret (such as an API key). This books file has no password, so it\n"
+                  "would be stored as readable text in the file and its backups. 'openbooks password set' protects it.\n";
+        answer(yes_ || askYesNo(c_, "Save it anyway?"));
+    }
+    bool pluginUi(const std::string&, const std::string&, const json::Value&) override { return false; }
+    void notify(const std::string& pluginId, const std::string& level, const std::string& message) override {
+        c_.err << "[" << pluginId << "] " << (level == "info" ? "" : level + ": ") << message << '\n';
+    }
+    std::optional<std::string> saveFile(const std::string&, const std::string&) override {
+        throw opl::Error("saving files from a plugin needs the desktop app");
+    }
+
+private:
+    Context& c_;
+    bool yes_;
+};
+
+const opl::PluginEntry& requireEntry(const std::vector<opl::PluginEntry>& entries, const std::string& ref) {
+    for (const auto& e : entries)
+        if (e.id() == ref || e.folder.filename().u8string() == ref) return e;
+    for (const auto& e : entries)
+        if (e.manifest && iequals(e.manifest->name, ref)) return e;
+    throw Error("no plugin '" + ref + "' is installed in " + plugins::pluginsDirectory());
+}
+
+void printPluginDetails(Context& c, const opl::PluginEntry& e, bool forApproval) {
+    if (!e.manifest) {
+        c.out << e.folder.filename().u8string() << ": " << e.detail << '\n';
+        return;
+    }
+    const opl::Manifest& m = *e.manifest;
+    c.out << m.name << ' ' << m.version << " by " << m.publisher << "  (" << m.id << ")\n";
+    if (!m.description.empty()) c.out << m.description << '\n';
+    if (!m.homepage.empty()) c.out << "Homepage: " << m.homepage << '\n';
+    c.out << "Folder:   " << e.folder.u8string() << '\n';
+    c.out << "Status:   " << opl::toString(e.status) << (e.detail.empty() ? "" : " (" + e.detail + ")") << '\n';
+    if (m.runtime == opl::Runtime::Lua)
+        c.out << "Runs as:  a Lua script in openplugin-runner's sandbox (no access to your files; network only to the hosts below)\n";
+    else
+        c.out << "Runs as:  a native program. NOT SANDBOXED: it can read your files and use the network freely.\n";
+    c.out << "\nIt asks to:\n";
+    if (m.permissions.empty()) c.out << "  (nothing)\n";
+    for (const std::string& p : m.permissions) {
+        const opl::PermissionInfo* info = opl::findPermission(p);
+        const bool isNew = std::find(e.newPermissions.begin(), e.newPermissions.end(), p) != e.newPermissions.end();
+        const bool has = e.grant && std::find(e.grant->permissions.begin(), e.grant->permissions.end(), p) != e.grant->permissions.end();
+        c.out << "  " << (forApproval ? "" : (has ? "[granted] " : "[-]       ")) << (info->high ? "! " : "") << info->description << "  (" << p
+              << ")" << (isNew ? "  NEW" : "") << '\n';
+    }
+    c.out << "\nIt may connect to:\n";
+    if (m.network.empty()) c.out << "  (no network access)\n";
+    for (const std::string& h : m.network) {
+        const bool isNew = std::find(e.newNetwork.begin(), e.newNetwork.end(), h) != e.newNetwork.end();
+        c.out << "  " << h << (opl::isDevelopmentHostPattern(h) ? "  (a local or test server)" : "") << (isNew ? "  NEW" : "") << '\n';
+    }
+    if (!m.commands.empty()) {
+        c.out << "\nCommands:\n";
+        for (const auto& cmd : m.commands) c.out << "  " << cmd.id << "  " << cmd.title << '\n';
+    }
+    if (!e.hash.empty()) c.out << "\nFiles (SHA-256 " << e.hash << "):\n";
+    try {
+        for (const std::string& f : opl::listPluginFiles(e.folder)) c.out << "  " << f << '\n';
+    } catch (const std::exception&) {
+    }
+}
+
+std::vector<std::string> splitList(const std::string& text) {
+    std::vector<std::string> out;
+    for (const std::string& part : split(text, ','))
+        if (!trim(part).empty()) out.push_back(trim(part));
+    return out;
+}
+
+void cmdPlugin(Context& c, Args& a) {
+    const std::string sub = a.positional(0, "a subcommand (list, show, enable, disable, use, run, data)");
+    const bool yes = a.flag("yes");
+    CliPluginDelegate delegate(c, yes);
+    plugins::PluginHost host(delegate);
+    if (const std::string problem = host.reload(); !problem.empty()) c.err << "warning: " << problem << '\n';
+
+    if (sub == "list") {
+        a.finish();
+        const auto entries = host.scan();
+        if (entries.empty()) {
+            c.out << "No plugins installed. Put plugin folders in " << plugins::pluginsDirectory() << '\n';
+            return;
+        }
+        Table t;
+        t.headers = {"Plugin", "ID", "Version", "Runs as", "Status"};
+        t.numeric = {false, false, false, false, false};
+        for (const auto& e : entries) {
+            if (!e.manifest) {
+                t.add({e.folder.filename().u8string(), "", "", "", "invalid: " + e.detail});
+                continue;
+            }
+            t.add({e.manifest->name, e.manifest->id, e.manifest->version,
+                   e.manifest->runtime == opl::Runtime::Lua ? "Lua (sandboxed)" : "native",
+                   std::string(opl::toString(e.status)) + (e.status == opl::PluginStatus::Enabled ? "" : e.detail.empty() ? "" : ": " + e.detail)});
+        }
+        print(c, t, false);
+        return;
+    }
+
+    const std::string ref = a.positional(1, "a plugin id");
+    const auto entries = host.scan();
+    const opl::PluginEntry& e = requireEntry(entries, ref);
+
+    if (sub == "show") {
+        a.finish();
+        printPluginDetails(c, e, false);
+        if (e.manifest && e.manifest->runtime == opl::Runtime::Lua && !host.runnerAvailable())
+            c.out << "\nNote: openplugin-runner isn't installed next to OpenBooks, so this plugin can't run.\n";
+    } else if (sub == "enable") {
+        const auto grantText = a.get("grant");
+        const auto hostsText = a.get("hosts");
+        a.finish();
+        if (!e.manifest || e.status == opl::PluginStatus::Invalid || e.status == opl::PluginStatus::Incompatible)
+            throw Error("this plugin can't be enabled: " + e.detail);
+        if (e.status == opl::PluginStatus::Enabled) {
+            c.out << e.manifest->name << " is already enabled.\n";
+            return;
+        }
+        const std::vector<std::string> perms = grantText ? splitList(*grantText) : e.manifest->permissions;
+        const std::vector<std::string> hosts = hostsText ? splitList(*hostsText) : e.manifest->network;
+        printPluginDetails(c, e, true);
+        c.out << "\nAn enabled plugin can only see your data in files where you turn it on ('openbooks plugin use').\n";
+        if (grantText || hostsText) {
+            c.out << "You are granting: " << (perms.empty() ? "no permissions" : join(perms, ", ")) << "; hosts: "
+                  << (hosts.empty() ? "none" : join(hosts, ", ")) << '\n';
+        }
+        if (!yes && !askYesNo(c, "Enable " + e.manifest->name + "?")) throw Error("not enabled");
+        host.registry().enable(e, perms, hosts);
+        c.out << "Enabled " << e.manifest->name << ".\n";
+    } else if (sub == "disable") {
+        a.finish();
+        host.registry().disable(e.id());
+        c.out << "Disabled " << (e.manifest ? e.manifest->name : e.id()) << ".\n";
+    } else if (sub == "use") {
+        const bool off = a.flag("off");
+        a.finish();
+        if (!e.manifest) throw Error(e.detail);
+        host.setUsedWithFile(e.id(), !off);
+        c.out << (off ? "Turned off " : "Turned on ") << e.manifest->name << " for " << c.path << ".\n";
+    } else if (sub == "run") {
+        const std::string command = a.positional(2, "a command id");
+        const auto contextText = a.get("context");
+        a.finish();
+        json::Value context = json::Object{};
+        if (contextText) {
+            try {
+                context = json::parse(*contextText);
+            } catch (const json::Error& err) {
+                throw Error(std::string("--context: ") + err.what());
+            }
+        }
+        std::optional<opl::rpc::Outcome> outcome;
+        host.runCommand(e.id(), command, std::move(context), [&](const opl::rpc::Outcome& o) { outcome = o; });
+        while (!outcome) host.poll(std::chrono::milliseconds(20));
+        if (!outcome->ok()) {
+            const std::string log = host.log(e.id());
+            if (!log.empty()) c.err << log;
+            throw Error((e.manifest ? e.manifest->name : e.id()) + ": " + outcome->message);
+        }
+        if (!outcome->result.isNull()) c.out << json::writePretty(outcome->result);
+        host.stopAll();
+    } else if (sub == "data") {
+        const bool remove = a.flag("remove");
+        a.finish();
+        const auto& entriesData = c.books().plugins.entries(e.id());
+        if (remove) {
+            if (entriesData.empty()) {
+                c.out << "No data from this plugin in " << c.path << ".\n";
+                return;
+            }
+            if (!yes && !askYesNo(c, "Delete everything " + (e.manifest ? e.manifest->name : e.id()) + " saved in " + c.path + "?"))
+                throw Error("nothing removed");
+            host.removeData(e.id());
+            c.out << "Removed.\n";
+            return;
+        }
+        if (entriesData.empty()) {
+            c.out << "No data from this plugin in " << c.path << ".\n";
+            return;
+        }
+        Table t;
+        t.headers = {"Key", "Value"};
+        t.numeric = {false, false};
+        for (const auto& [key, entry] : entriesData) t.add({key, entry.secret ? "(secret, hidden)" : entry.value});
+        print(c, t, false);
+    } else {
+        throw Error("usage: openbooks plugin list|show|enable|disable|use|run|data ...");
+    }
+}
+
 struct Command {
     std::string name;
     std::string usage;
@@ -1300,6 +1538,18 @@ const std::vector<Command>& commands() {
          "  openbooks reconcile ACCOUNT [--through D] [--clear TXN,TXN,...] [--unclear TXN,...]\n"
          "                      [--statement-balance X [--finish]]",
          "Reconcile a bank or credit card account against a statement", cmdReconcile},
+        {"plugin",
+         "  openbooks plugin list\n"
+         "  openbooks plugin show PLUGIN\n"
+         "  openbooks plugin enable PLUGIN [--grant PERM,PERM] [--hosts HOST,HOST] [--yes]\n"
+         "  openbooks plugin disable PLUGIN\n"
+         "  openbooks plugin use PLUGIN [--off]            (turn it on or off for this books file)\n"
+         "  openbooks plugin run PLUGIN COMMAND [--context JSON] [--yes]\n"
+         "  openbooks plugin data PLUGIN [--remove] [--yes]\n"
+         "  Plugins live in your settings folder (see 'plugin list'). Enabling one asks you to approve what\n"
+         "  it may see and which servers it may contact; any change to its files needs approval again.\n"
+         "  Changes a plugin proposes are shown for you to approve (--yes approves them without asking).",
+         "Manage and run plugins (payment portals and other add-ons)", cmdPlugin},
         {"shell", "  openbooks shell", "Interactive mode: run many commands against the same books",
          [](Context& c, Args& a) {
              a.finish();

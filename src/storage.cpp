@@ -2,7 +2,7 @@
 //
 // A UTF-8 text file with one record per line and tab-separated fields. Backslash,
 // tab, CR and LF inside fields are escaped as \\ \t \r \n. The first line is
-// "OPENBOOKS<TAB>1". Child records (SPLIT, LINE, APPLY) refer to their parent by id.
+// "OPENBOOKS<TAB>version". Child records (SPLIT, LINE, APPLY) refer to their parent by id.
 // The format is deliberately simple so books stay readable, diffable and recoverable
 // without OpenBooks itself.
 
@@ -67,7 +67,10 @@ void record(std::ostream& out, std::initializer_list<std::string> fields) {
     out << '\n';
 }
 
+// Version 3 adds PLUGIN records. It is only written when a file has plugin data, so books that
+// never used a plugin still open in OpenBooks 0.4 and 0.5.
 constexpr int kFileVersion = 2;
+constexpr int kFileVersionWithPlugins = 3;
 
 std::string num(int v) { return std::to_string(v); }
 std::string flag(bool v) { return v ? "1" : "0"; }
@@ -163,7 +166,7 @@ void sortAndCheckIds(std::vector<T>& v, const char* what) {
 }  // namespace
 
 void Book::write(std::ostream& out) const {
-    out << "OPENBOOKS\t" << kFileVersion << "\n";
+    out << "OPENBOOKS\t" << (plugins.empty() ? kFileVersion : kFileVersionWithPlugins) << "\n";
     const Company& c = company;
     record(out, {"COMPANY", c.name, c.address, num(c.fiscalYearStartMonth), num(c.defaultTermsDays),
                  c.closedThrough ? c.closedThrough->str() : "", num(c.nextInvoiceNumber),
@@ -207,6 +210,9 @@ void Book::write(std::ostream& out) const {
                      p.amount.str(), p.ref, p.memo, num(p.txnId), flag(p.voided)});
         for (const auto& a : p.applications) record(out, {"APPLY", num(p.id), num(a.documentId), a.amount.str()});
     }
+    for (const std::string& id : plugins.plugins())
+        for (const auto& [key, entry] : plugins.entries(id))
+            record(out, {"PLUGIN", id, key, entry.secret ? "secret" : "", entry.value});
 }
 
 Book Book::read(std::istream& in) {
@@ -219,8 +225,9 @@ Book Book::read(std::istream& in) {
     const auto header = split(line, '\t');
     if (header.size() < 2 || header[0] != "OPENBOOKS") throw Error("this is not an OpenBooks file");
     // Version 1: up to 0.3. Version 2 (0.4) adds estimates, credit memos, sales receipts and
-    // recurring invoices; older OpenBooks releases refuse it rather than misread it.
-    if (header[1] != "1" && header[1] != "2")
+    // recurring invoices; older OpenBooks releases refuse it rather than misread it. Version 3
+    // (0.6) adds PLUGIN records.
+    if (header[1] != "1" && header[1] != "2" && header[1] != "3")
         throw Error("unsupported OpenBooks file version " + header[1] + "; upgrade OpenBooks");
 
     std::map<int, std::size_t> txnIndex;
@@ -393,6 +400,14 @@ Book Book::read(std::istream& in) {
             l.taxable = f.boolean(7);
             l.description = f.str(8);
             b.recurring_[it->second].lines.push_back(std::move(l));
+        } else if (type == "PLUGIN") {
+            const std::string& flags = f.str(3);
+            if (!flags.empty() && flags != "secret") f.fail("invalid plugin data flags '" + flags + "'");
+            try {
+                b.plugins.load(f.str(1), f.str(2), f.str(4), flags == "secret");
+            } catch (const opl::StoreError& e) {
+                f.fail(e.what());
+            }
         } else {
             f.fail("unknown record type '" + type + "'");
         }

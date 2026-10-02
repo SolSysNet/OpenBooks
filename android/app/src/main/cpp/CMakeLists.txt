@@ -19,9 +19,20 @@ add_library(openbooks SHARED
     ${REPO}/src/pdf.cpp
     ${REPO}/src/invoice_pdf.cpp
     ${REPO}/src/reports.cpp
+    ${REPO}/src/paths.cpp
+    ${REPO}/src/plugins.cpp
     ${REPO}/src/cli.cpp
+    # The plugin host (no network code). Android doesn't run plugins, but books files keep the data
+    # plugins saved in them (PLUGIN records) when they are opened and saved here.
+    ${REPO}/third_party/openplugin/src/json.cpp
+    ${REPO}/third_party/openplugin/src/sha256.cpp
+    ${REPO}/third_party/openplugin/src/process.cpp
+    ${REPO}/third_party/openplugin/src/rpc.cpp
+    ${REPO}/third_party/openplugin/src/manifest.cpp
+    ${REPO}/third_party/openplugin/src/registry.cpp
+    ${REPO}/third_party/openplugin/src/store.cpp
 )
-target_include_directories(openbooks PRIVATE ${REPO}/include ${REPO}/src)
+target_include_directories(openbooks PRIVATE ${REPO}/include ${REPO}/src ${REPO}/third_party/openplugin/include)
 target_compile_features(openbooks PRIVATE cxx_std_17)
 target_compile_options(openbooks PRIVATE -Wall -Wextra -Wpedantic -fvisibility=hidden)
 # 16 KB page alignment, required for apps on Android 15+ devices.
